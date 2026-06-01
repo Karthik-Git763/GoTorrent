@@ -6,7 +6,7 @@ import (
 )
 
 // Decode parses a single bencoded value from data and returns:
-//   - the decoded value (int64 for integers, string for strings)
+//   - the decoded value (int64 for integers, string for strings, []interface{} for lists, map[string]interface{} for dictionaries)
 //   - the remaining unconsumed bytes
 //   - any error encountered
 func Decode(data []byte) (interface{}, []byte, error) {
@@ -18,6 +18,10 @@ func Decode(data []byte) (interface{}, []byte, error) {
 		return decodeInteger(data)
 	case data[0] >= '0' && data[0] <= '9':
 		return decodeString(data)
+	case data[0] == 'l':
+		return decodeList(data)
+	case data[0] == 'd':
+		return decodeDict(data)
 	default:
 		return nil, data, fmt.Errorf("unknown type: %c", data[0])
 	}
@@ -70,4 +74,72 @@ func decodeString(data []byte) (interface{}, []byte, error) {
 	}
 
 	return string(data[start : start+length]), data[start+length:], nil
+}
+
+// decodeList decodes a bencode list in the form l<items>e.
+func decodeList(data []byte) (interface{}, []byte, error) {
+	if len(data) == 0 || data[0] != 'l' {
+		return nil, data, fmt.Errorf("invalid list: missing 'l'")
+	}
+
+	list := make([]interface{}, 0)
+	idx := 1
+	for {
+		if idx >= len(data) {
+			return nil, data, fmt.Errorf("invalid list: missing 'e'")
+		}
+		if data[idx] == 'e' {
+			return list, data[idx+1:], nil
+		}
+
+		item, rest, err := Decode(data[idx:])
+		if err != nil {
+			return nil, data, err
+		}
+		list = append(list, item)
+
+		consumed := len(data[idx:]) - len(rest)
+		idx += consumed
+	}
+}
+
+// decodeDict decodes a bencode dictionary in the form d<items>e.
+func decodeDict(data []byte) (map[string]interface{}, []byte, error) {
+	if len(data) == 0 || data[0] != 'd' {
+		return nil, data, fmt.Errorf("invalid dict: missing 'd'")
+	}
+
+	dict := make(map[string]interface{})
+	idx := 1
+	for {
+		if idx >= len(data) {
+			return nil, data, fmt.Errorf("invalid dict: missing 'e'")
+		}
+		if data[idx] == 'e' {
+			return dict, data[idx+1:], nil
+		}
+
+		keyVal, rest, err := Decode(data[idx:])
+		if err != nil {
+			return nil, data, err
+		}
+		key, ok := keyVal.(string)
+		if !ok {
+			return nil, data, fmt.Errorf("invalid dict key: expected string, got %T", keyVal)
+		}
+		consumed := len(data[idx:]) - len(rest)
+		idx += consumed
+
+		if idx >= len(data) {
+			return nil, data, fmt.Errorf("invalid dict: missing value for key %q", key)
+		}
+
+		value, rest, err := Decode(data[idx:])
+		if err != nil {
+			return nil, data, err
+		}
+		dict[key] = value
+		consumed = len(data[idx:]) - len(rest)
+		idx += consumed
+	}
 }

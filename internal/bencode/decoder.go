@@ -9,7 +9,7 @@ import (
 //   - the decoded value (int64 for integers, string for strings, []interface{} for lists, map[string]interface{} for dictionaries)
 //   - the remaining unconsumed bytes
 //   - any error encountered
-func Decode(data []byte) (interface{}, []byte, error) {
+func Decode(data []byte) (any, []byte, error) {
 	if len(data) == 0 {
 		return nil, data, fmt.Errorf("empty input")
 	}
@@ -28,7 +28,7 @@ func Decode(data []byte) (interface{}, []byte, error) {
 }
 
 // decodeInteger decodes a bencode integer in the form i<number>e.
-func decodeInteger(data []byte) (interface{}, []byte, error) {
+func decodeInteger(data []byte) (any, []byte, error) {
 	// data[0] is 'i', find the closing 'e'
 	end := 1
 	for end < len(data) && data[end] != 'e' {
@@ -48,7 +48,7 @@ func decodeInteger(data []byte) (interface{}, []byte, error) {
 }
 
 // decodeString decodes a bencode string in the form <length>:<content>.
-func decodeString(data []byte) (interface{}, []byte, error) {
+func decodeString(data []byte) (any, []byte, error) {
 	// Find the ':'
 	colon := 0
 	for colon < len(data) && data[colon] != ':' {
@@ -77,12 +77,12 @@ func decodeString(data []byte) (interface{}, []byte, error) {
 }
 
 // decodeList decodes a bencode list in the form l<items>e.
-func decodeList(data []byte) (interface{}, []byte, error) {
+func decodeList(data []byte) (any, []byte, error) {
 	if len(data) == 0 || data[0] != 'l' {
 		return nil, data, fmt.Errorf("invalid list: missing 'l'")
 	}
 
-	list := make([]interface{}, 0)
+	list := make([]any, 0)
 	idx := 1
 	for {
 		if idx >= len(data) {
@@ -104,12 +104,12 @@ func decodeList(data []byte) (interface{}, []byte, error) {
 }
 
 // decodeDict decodes a bencode dictionary in the form d<items>e.
-func decodeDict(data []byte) (map[string]interface{}, []byte, error) {
+func decodeDict(data []byte) (map[string]any, []byte, error) {
 	if len(data) == 0 || data[0] != 'd' {
 		return nil, data, fmt.Errorf("invalid dict: missing 'd'")
 	}
 
-	dict := make(map[string]interface{})
+	dict := make(map[string]any)
 	idx := 1
 	for {
 		if idx >= len(data) {

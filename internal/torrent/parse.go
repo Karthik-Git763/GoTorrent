@@ -44,7 +44,15 @@ func (tf *TorrentFile) Parse(rawTorrent []byte) error {
 	}
 	length, ok := infoMap["length"].(int64)
 	if !ok {
-		return fmt.Errorf("invalid torrent: missing length")
+		filesVal, hasFiles := infoMap["files"].([]any)
+		if !hasFiles {
+			return fmt.Errorf("invalid torrent: missing length")
+		}
+		filesLength, err := sumFilesLength(filesVal)
+		if err != nil {
+			return err
+		}
+		length = filesLength
 	}
 	name, ok := infoMap["name"].(string)
 	if !ok {
@@ -110,6 +118,22 @@ func extractInfo(rawTorrent []byte) ([]byte, map[string]any, error) {
 	}
 
 	return nil, nil, fmt.Errorf("invalid torrent: missing info dict")
+}
+
+func sumFilesLength(files []any) (int64, error) {
+	var total int64
+	for _, entry := range files {
+		fileMap, ok := entry.(map[string]any)
+		if !ok {
+			return 0, fmt.Errorf("invalid torrent: files entry is not a dict")
+		}
+		lengthVal, ok := fileMap["length"].(int64)
+		if !ok {
+			return 0, fmt.Errorf("invalid torrent: file entry missing length")
+		}
+		total += lengthVal
+	}
+	return total, nil
 }
 
 func splitPieceHashes(pieces []byte) ([][20]byte, error) {

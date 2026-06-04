@@ -36,32 +36,10 @@ const (
 // Magic connection ID for UDP tracker
 const MagicConnectionID uint64 = 0x41727101980
 
-type ConnectionRequest struct {
-	connectionID uint64
-	action uint32
-	transactionID uint32
-}
-
 type ConnectionResponse struct {
 	action uint32
 	transactionID uint32
 	connectionID uint64
-}
-
-type AnnounceRequest struct {
-	connectionID uint64
-	action uint32
-	transactionID uint32
-	infoHash [20]byte
-	peerID [20]byte
-	downloaded int64
-	uploaded int64
-	left int64
-	event int32
-	IP net.IP
-	port uint16
-	numWant int32
-	key int32
 }
 
 type AnnounceResponse struct {

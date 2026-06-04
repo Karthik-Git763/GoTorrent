@@ -6,7 +6,7 @@ import (
 )
 
 func TestParseRealTorrent(t *testing.T) {
-	data, err := os.ReadFile("testdata/debian.torrent")
+	data, err := os.ReadFile("testdata/big-buck-bunny.torrent")
 	if err != nil {
 		t.Fatal(err)
 	}

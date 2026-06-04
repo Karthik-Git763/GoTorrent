@@ -12,6 +12,9 @@ type UDPTracker struct {
 	conn *net.UDPConn
 	transactionID uint32
 	connectionID uint64
+	connectionCreatedAt time.Time
+	addr *net.UDPAddr
+	started bool
 }
 
 // Actions
@@ -85,7 +88,12 @@ func (t *UDPTracker) Connect(addr *net.UDPAddr) (uint64, error) {
 	if err != nil {
 		return 0, err
 	}
-	t.conn = conn
+	success := false
+	defer func() {
+		if !success {
+			conn.Close()
+		}
+	}()
 	
 	// Read response (16 bytes) with timeout
 	conn.SetReadDeadline(
@@ -108,7 +116,7 @@ func (t *UDPTracker) Connect(addr *net.UDPAddr) (uint64, error) {
 	
 	action := binary.BigEndian.Uint32(buf[0:4])
 	if action == ActionError {
-		return 0, fmt.Errorf("Tracker returned error")
+		return 0, fmt.Errorf("Tracker error %s", string(buf[8:n]))
 	}
 	
 	resp := ConnectionResponse{
@@ -124,15 +132,29 @@ func (t *UDPTracker) Connect(addr *net.UDPAddr) (uint64, error) {
 	if resp.transactionID != t.transactionID {
 		return 0, fmt.Errorf("transaction ID mismatch")
 	}
+	success = true
+	t.conn = conn
 	t.connectionID = resp.connectionID
+	t.connectionCreatedAt = time.Now()
+	t.addr = addr
 	// Return connection ID
 	return resp.connectionID, nil
 }
 
 func (t *UDPTracker) Announce(infoHash [20]byte, peerID [20]byte, port uint16, totalLength uint64) ([]Peer, int, error) {
-	if t.conn == nil {
-		return nil, 0, fmt.Errorf("not connected")
+	if t.addr == nil {
+		return nil, 0, fmt.Errorf("tracker address not set")
 	}
+	if err := t.EnsureConnection(); err != nil {
+		return nil, 0, err
+	}
+
+	event := uint32(EventNone)
+	if !t.started {
+		event = EventStarted
+		t.started = true
+	}
+	
 	// Pack announce request: connID(8) + action(4) + transactionID(4) + infoHash(20) + peer_id(20)
 	//  + download(8) + upload(8) + left(8) + event(4) + ip_addr(4) + key(4) + num_want(4) + port(2) - 98 bytes overhead
 	buf := make([]byte, 98)
@@ -145,7 +167,7 @@ func (t *UDPTracker) Announce(infoHash [20]byte, peerID [20]byte, port uint16, t
 	binary.BigEndian.PutUint64(buf[56:64], 0) // download
 	binary.BigEndian.PutUint64(buf[64:72], totalLength) // left
 	binary.BigEndian.PutUint64(buf[72:80], 0) // upload
-	binary.BigEndian.PutUint32(buf[80:84], EventStarted) // event
+	binary.BigEndian.PutUint32(buf[80:84], event) // event
 	binary.BigEndian.PutUint32(buf[84:88], 0) // ip_addr
 	binary.BigEndian.PutUint32(buf[88:92], rand.Uint32()) // key
 	binary.BigEndian.PutUint32(buf[92:96], 0xFFFFFFFF) // num_want
@@ -174,7 +196,7 @@ func (t *UDPTracker) Announce(infoHash [20]byte, peerID [20]byte, port uint16, t
 	action := binary.BigEndian.Uint32(buf[0:4])
 	
 	if action == ActionError {
-		return nil, 0, fmt.Errorf("tracker returned error")
+		return nil, 0, fmt.Errorf("tracker error %s", string(buf[8:n]))
 	}
 	// Parse response
 	resp := AnnounceResponse {
@@ -192,9 +214,11 @@ func (t *UDPTracker) Announce(infoHash [20]byte, peerID [20]byte, port uint16, t
 	peerCount := len(peerBytes) / 6
 
 	resp.peers = make([]Peer, peerCount)
-	for i := 0; i < peerCount; i++ {
+	for i := range peerCount {
+		ip := make(net.IP, 4)
+		copy(ip, peerBytes[i*6:i*6+4])
 		resp.peers[i] = Peer {
-			IP:   net.IP(peerBytes[i*6:i*6+4]),
+			IP:   ip,
 			Port: uint16(binary.BigEndian.Uint16(peerBytes[i*6+4:i*6+6])),
 		}
 	}
@@ -211,9 +235,37 @@ func (t *UDPTracker) Announce(infoHash [20]byte, peerID [20]byte, port uint16, t
 	return resp.peers, int(resp.interval), nil
 }
 
+// connectionExpired returns true if the connection has expired (more than a minute since creation) 55 seconds for avoiding edge cases
+func (t *UDPTracker) connectionExpired() bool {
+	return time.Since(t.connectionCreatedAt) > 55*time.Second
+}
+
+// Ensure the connection is not expired before sending an announce
+func (t *UDPTracker) EnsureConnection() error {
+	if t.conn == nil {
+		_, err := t.Connect(t.addr)
+		return err
+	}
+	if t.connectionExpired() {
+		if t.conn != nil {
+			t.conn.Close()
+			t.conn = nil
+			t.connectionID = 0
+			t.connectionCreatedAt = time.Time{}
+		}
+		_, err := t.Connect(t.addr)
+		return err
+	}
+	return nil
+}
+
 func (t *UDPTracker) Close() error {
     if t.conn != nil {
-        return t.conn.Close()
+        err := t.conn.Close()
+        t.conn = nil
+        t.connectionID = 0
+        t.connectionCreatedAt = time.Time{}
+        return err
     }
     return nil
 }

@@ -17,11 +17,14 @@ type Peer struct {
 	Port uint16
 }
 
+// AnnounceHTTP sends an HTTP announce request to the tracker and returns the list of peers.
 func AnnounceHTTP(announceURL string, infoHash [20]byte, peerID [20]byte, port uint16, totalLength int64) ([]Peer, error) {
+	// Parse the announce URL
 	parsedURL, err := url.Parse(announceURL)
 	if err != nil {
 		return nil, err
 	}
+	// Set the query parameters
 	query := parsedURL.Query()
 	query.Set("info_hash", escapeBytes(infoHash[:]))
 	query.Set("peer_id", escapeBytes(peerID[:]))
@@ -30,24 +33,32 @@ func AnnounceHTTP(announceURL string, infoHash [20]byte, peerID [20]byte, port u
 	query.Set("downloaded", "0")
 	query.Set("left", fmt.Sprintf("%d", totalLength))
 	query.Set("compact", "1")
+	// Encode the query parameters and set the URL
 	parsedURL.RawQuery = query.Encode()
 	req, err := http.Get(parsedURL.String())
 	if err != nil {
 		return nil, err
 	}
+	// Close the response body when done
 	defer req.Body.Close()
+	// Read the response body
 	body, err := io.ReadAll(req.Body)
 	if err != nil {
 		return nil, err
 	}
+	// Parse the response body
 	return parseHTTPResponse(body)
 }
 
+// parseHTTPResponse parses the HTTP response body and returns a list of peers.
 func parseHTTPResponse(body []byte) ([]Peer, error) {
+	// Decode the response body
 	decoded, _, err := bencode.Decode(body)
 	if err != nil {
 		return nil, err
 	}
+	
+	// Check the response type
 	top, ok := decoded.(map[string]any)
 	if !ok {
 		return nil, fmt.Errorf("invalid tracker response: expected dict")
@@ -56,11 +67,13 @@ func parseHTTPResponse(body []byte) ([]Peer, error) {
 		return nil, fmt.Errorf("tracker failure: %s", failure)
 	}
 
+	// Check for peers in the response
 	peersVal, ok := top["peers"]
 	if !ok {
 		return nil, fmt.Errorf("invalid tracker response: missing peers")
 	}
-
+	
+	// Unmarshal the peers based on their type
 	switch peers := peersVal.(type) {
 	case string:
 		return unmarshalCompactPeers([]byte(peers))
@@ -108,6 +121,7 @@ func unmarshalPeerList(peersList []any) ([]Peer, error) {
 	return peers, nil
 }
 
+// escapeBytes escapes special characters in a byte slice for use in URLs.
 func escapeBytes(b []byte) string {
 	var sb strings.Builder
 	for _, c := range b {

@@ -135,8 +135,8 @@ func (t *UDPTracker) Announce(infoHash [20]byte, peerID [20]byte, port uint16, t
 		t.started = true
 	}
 	
-	// Pack announce request: connID(8) + action(4) + transactionID(4) + infoHash(20) + peer_id(20)
-	//  + download(8) + upload(8) + left(8) + event(4) + ip_addr(4) + key(4) + num_want(4) + port(2) - 98 bytes overhead
+	// Pack announce request (BEP 15): connID(8) + action(4) + txID(4) + infoHash(20) + peerID(20)
+	// + downloaded(8) + left(8) + uploaded(8) + event(4) + ip_addr(4) + key(4) + num_want(4) + port(2) = 98 bytes
 	buf := make([]byte, 98)
 	binary.BigEndian.PutUint64(buf[0:8], t.connectionID)
 	binary.BigEndian.PutUint32(buf[8:12], uint32(ActionAnnounce))
@@ -144,9 +144,9 @@ func (t *UDPTracker) Announce(infoHash [20]byte, peerID [20]byte, port uint16, t
 	binary.BigEndian.PutUint32(buf[12:16], announceTxID)
 	copy(buf[16:36], infoHash[:])
 	copy(buf[36:56], peerID[:])
-	binary.BigEndian.PutUint64(buf[56:64], 0) // download
+	binary.BigEndian.PutUint64(buf[56:64], 0) // downloaded
 	binary.BigEndian.PutUint64(buf[64:72], totalLength) // left
-	binary.BigEndian.PutUint64(buf[72:80], 0) // upload
+	binary.BigEndian.PutUint64(buf[72:80], 0) // uploaded
 	binary.BigEndian.PutUint32(buf[80:84], event) // event
 	binary.BigEndian.PutUint32(buf[84:88], 0) // ip_addr
 	binary.BigEndian.PutUint32(buf[88:92], rand.Uint32()) // key

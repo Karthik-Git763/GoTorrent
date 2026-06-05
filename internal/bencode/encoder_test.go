@@ -73,7 +73,10 @@ func TestMarshalMapIntValues(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(got) != "d5:counti3e4:sizei9ee" {
-		t.Fatalf("unexpected output: %q", string(got))
+	// Map iteration order is non-deterministic in Go; accept both orderings.
+	want1 := "d5:counti3e4:sizei9ee"
+	want2 := "d4:sizei9e5:counti3ee"
+	if string(got) != want1 && string(got) != want2 {
+		t.Fatalf("unexpected output: %q (expected either %q or %q)", string(got), want1, want2)
 	}
 }

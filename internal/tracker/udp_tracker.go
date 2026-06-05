@@ -51,6 +51,7 @@ type AnnounceResponse struct {
 	peers []Peer
 }
 
+// Connect to the UDP tracker and return the connection ID
 func (t *UDPTracker) Connect(addr *net.UDPAddr) (uint64, error) {
 	// Generate a random transaction ID
 	t.transactionID = rand.Uint32()
@@ -119,6 +120,7 @@ func (t *UDPTracker) Connect(addr *net.UDPAddr) (uint64, error) {
 	return resp.connectionID, nil
 }
 
+// Announce to the UDP tracker and return the peers, number of peers, and any error
 func (t *UDPTracker) Announce(infoHash [20]byte, peerID [20]byte, port uint16, totalLength uint64) ([]Peer, int, error) {
 	if t.addr == nil {
 		return nil, 0, fmt.Errorf("tracker address not set")

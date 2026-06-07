@@ -58,8 +58,8 @@ func ReadMessage(r io.Reader) (*Message, error) {
 
 func WriteMessage(w io.Writer, msg *Message) error {
 	// length = 1 (ID) + len(Payload)
-	buf := make([]byte, 4+1+len(msg.Payload))
-	binary.BigEndian.PutUint32(buf[0:4], uint32(1+len(msg.Payload)))
+	buf := make([]byte, 4+1+len(msg.Payload)) // 4 bytes for length, 1 byte for ID, len(Payload) bytes for payload
+	binary.BigEndian.PutUint32(buf[0:4], uint32(1+len(msg.Payload))) // store the length of the payload (1 byte for ID + len(Payload))
 	buf[4] = byte(msg.ID)
 	copy(buf[5:], msg.Payload)
 	_, err := w.Write(buf)

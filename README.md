@@ -1,44 +1,48 @@
 # GoTorrent
 
-A BitTorrent client built from scratch in Go. Implements the core protocol stack — bencode, metadata parsing, tracker communication (HTTP + UDP), and peer wire protocol — with no framework dependencies beyond the Go standard library.
+A BitTorrent client built from scratch in Go. Standard library only — every protocol byte is handled explicitly.
 
-## What's Built
+## Status
 
-| Layer | Status |
-|---|---|
-| Bencode encoder/decoder | Done |
-| Torrent file parser (single & multi-file) | Done |
-| InfoHash computation (SHA1 of raw `info` dict) | Done |
-| HTTP tracker announce (BEP 3) | Done |
-| UDP tracker announce (BEP 15) | Done |
-| Mock tracker server (offline testing) | Done |
-| Peer wire protocol (handshake, messages) | Next |
-| Piece download manager | Next |
+| Layer | Package | Status |
+|-------|---------|--------|
+| Bencode encoder/decoder | `internal/bencode/` | ✅ Done |
+| Torrent file parser + infohash | `internal/torrent/` | ✅ Done |
+| HTTP/UDP tracker announce | `internal/tracker/` | ✅ Done |
+| Peer wire protocol | `internal/peer/` | ✅ Done |
+| Piece download manager | `internal/piece/` | 🔜 Week 4 |
+
+## Build
+
+```bash
+go build ./cmd/gotorrent/
+go test ./... -v
+./gotorrent path/to/file.torrent
+```
 
 ## Architecture
 
 ```
-cmd/gotorrent/          ─ CLI entry point
-internal/piece/         ─ Piece download manager (in progress)
-internal/peer/          ─ Peer wire protocol (in progress)
-internal/tracker/       ─ HTTP + UDP tracker announce
-internal/torrent/       ─ Torrent file parsing, infohash
-internal/bencode/       ─ Recursive-descent bencode encoder/decoder
+.torrent → bencode.Decode → torrent.Parse → Infohash (SHA1)
+    ↓
+tracker.Announce(HTTP/UDP) → []Peer{IP, Port}
+    ↓
+peer.ConnectToPeers → TCP handshake → goroutine pair per peer
+    ↓
+piece.Manager → work queue → rarest-first → SHA1 verify → file
 ```
 
-The bencode parser handles all wire types (integers, strings, lists, dicts, arbitrary nesting). The torrent parser extracts announce URLs, piece hashes, and computes the infohash from the raw bencoded info dict — the encoding isn't round-tripped through the decoded form, so the hash is guaranteed correct. The tracker layer supports both HTTP (compact and dictionary peer formats) and UDP (BEP 15 two-step connect/announce with auto-reconnection on connection expiry).
-
-## Build & Run
-
-```bash
-go build ./cmd/gotorrent/
-./gotorrent path/to/file.torrent
-go test ./...
-```
+**Key design choices:**
+- **Recursive-descent bencode parser** — cursor-based, returns unconsumed remainder
+- **Infohash from raw bytes** — SHA1 of the raw `info` dict (not re-encoded — would change sort order)
+- **Dual tracker** — HTTP (BEP 3) + UDP (BEP 15) with auto-reconnect on connection expiry
+- **Goroutine pair per peer** — reader goroutine + writer goroutine communicating over buffered channels
+- **`sync.Once`** idempotent Close, **`atomic.Bool`** lock-free choked state, **`sync.Cond`** writer park/unpark
+- **`io.ReadFull` on every TCP read** — TCP streams; never trust `conn.Read()` for exact byte counts
 
 ## Roadmap
 
-- **Peer wire protocol** — Handshake, message types (choke/unchoke/bitfield/request/piece), goroutine-based concurrent reader/writer per peer connection
-- **Piece download** — Work queue, rarest-first selection, SHA1 block verification, end-to-end download loop
-- **Resume, rate limiting, TUI, magnet links** — Download state persistence, token-bucket rate control, Bubble Tea progress UI, BEP 9 metadata extension
-- **Stretch** — DHT (BEP 5), PEX (BEP 11), uTP (BEP 29)
+- **Week 4** — Piece download manager: work queue, rarest-first selection, SHA1 verification, download loop
+- **Week 5** — Resume downloads, rate limiting, TUI (Bubble Tea), magnet links (BEP 9), end-game mode
+- **Week 6** — Integration tests, error handling, graceful shutdown, race detection
+- **Weeks 7-8** — DHT (BEP 5), PEX (BEP 11), uTP (BEP 29)

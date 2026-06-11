@@ -167,3 +167,18 @@ func (pc *PeerConnection) Close() {
 		pc.conn.Close()
 	})
 }
+
+// SetBitfield updates the peer's bitfield (which pieces the peer has).
+func (pc *PeerConnection) SetBitfield(bitfield []bool) {
+	pc.bitfield = bitfield
+}
+
+// Bitfield returns the peer's current bitfield.
+func (pc *PeerConnection) Bitfield() []bool {
+	return pc.bitfield
+}
+
+// Incoming returns the read-only channel of messages from this peer.
+func (pc *PeerConnection) Incoming() <-chan *Message {
+	return pc.incoming
+}

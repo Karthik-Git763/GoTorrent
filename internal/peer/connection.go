@@ -158,12 +158,14 @@ func BuildRequest(index, begin, length int) *Message {
 }
 
 func (pc *PeerConnection) Close() {
-	pc.closeOnce.Do(func() { // if multiple Close calls are made, only the first one will execute else close(pc.pieceQueue) causes a panic
+	pc.closeOnce.Do(func() {
 		pc.cancel()
 		pc.choked.Store(false) // wake the writer out of waitForUnchoke
 		pc.unchokeCond.Broadcast()
-		close(pc.pieceQueue)
-		close(pc.incoming)
+		// Don't close channels explicitly: the context cancellation makes
+		// the reader/writer goroutines exit via ctx.Done() in their
+		// select statements. Closing channels concurrently with sends
+		// (reader->incoming, writer<-pieceQueue) causes a data race.
 		pc.conn.Close()
 	})
 }

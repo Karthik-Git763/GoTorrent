@@ -12,14 +12,14 @@ import (
 )
 
 func TestGeneratePeerID_Length(t *testing.T) {
-	id := generatePeerID()
+	id := GeneratePeerID()
 	if len(id) != 20 {
 		t.Fatalf("expected 20 bytes, got %d", len(id))
 	}
 }
 
 func TestGeneratePeerID_Prefix(t *testing.T) {
-	id := generatePeerID()
+	id := GeneratePeerID()
 	prefix := string(id[:8])
 	if prefix != "-GT0001-" {
 		t.Fatalf("expected prefix '-GT0001-', got %q", prefix)
@@ -29,7 +29,7 @@ func TestGeneratePeerID_Prefix(t *testing.T) {
 func TestGeneratePeerID_Uniqueness(t *testing.T) {
 	seen := make(map[[20]byte]bool)
 	for range 100 {
-		id := generatePeerID()
+		id := GeneratePeerID()
 		if seen[id] {
 			t.Fatal("duplicate peer ID generated")
 		}
@@ -38,7 +38,7 @@ func TestGeneratePeerID_Uniqueness(t *testing.T) {
 }
 
 func TestGeneratePeerID_Printable(t *testing.T) {
-	id := generatePeerID()
+	id := GeneratePeerID()
 	for i := 8; i < 20; i++ {
 		b := id[i]
 		if !((b >= 'a' && b <= 'z') || (b >= '0' && b <= '9')) {

@@ -13,8 +13,8 @@ import (
 
 const peerIDPrefix = "-GT0001-"
 
-// generatePeerID creates a 20-byte BitTorrent peer ID with GoTorrent's client prefix.
-func generatePeerID() [20]byte {
+// GeneratePeerID creates a 20-byte BitTorrent peer ID with GoTorrent's client prefix.
+func GeneratePeerID() [20]byte {
 	var id [20]byte
 	copy(id[:], peerIDPrefix) // 8 bytes: "-GT0001-"
 
@@ -61,7 +61,7 @@ func ConnectToPeers(torrent *torrent.TorrentFile, peers []tracker.Peer) []*PeerC
 			}
 
 			// BitTorrent handshake
-			peerID := generatePeerID()
+			peerID := GeneratePeerID()
 			remoteID, err := Handshake(conn, torrent.InfoHash, peerID)
 			if err != nil {
 				conn.Close()

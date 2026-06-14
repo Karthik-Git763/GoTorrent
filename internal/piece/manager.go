@@ -44,6 +44,8 @@ type Manager struct {
 	peers        []*peer.PeerConnection
 	completed    []bool
 	pieceResults chan PieceResult // workers -> manager collector
+	outputName   string           // torrent name for output files
+	files        []torrent.FileEntry // multi-file entries (nil for single-file)
 
 	mu            sync.Mutex
 	pendingPieces map[uint32]*PieceBuffer
@@ -59,6 +61,8 @@ func NewManager(torrent *torrent.TorrentFile, peers []*peer.PeerConnection) *Man
 		totalLength:   uint64(torrent.Length),
 		pieceHashes:   torrent.PieceHashes,
 		peers:         peers,
+		outputName:    torrent.Name,
+		files:         torrent.Files,
 		completed:     make([]bool, len(torrent.PieceHashes)),
 		pieceResults:  make(chan PieceResult, 32),
 		pendingPieces: make(map[uint32]*PieceBuffer),
@@ -71,13 +75,26 @@ func NewManager(torrent *torrent.TorrentFile, peers []*peer.PeerConnection) *Man
 //  2. launch one worker goroutine per connected peer
 //  3. collect and assemble piece results
 //  4. verify each piece SHA1 hash
-//  5. write verified pieces to file
+//  5. write verified pieces to the output file(s)
 //
 // Blocks until all pieces are downloaded or an error occurs.
-func (m *Manager) Download(outputPath string, infoHash [20]byte, peerID [20]byte, port uint16) error {
+func (m *Manager) Download(outputPath string) error {
 	if len(m.peers) == 0 {
 		return fmt.Errorf("no peers available")
 	}
+
+	// Create the piece writer for the output file(s)
+	tf := &torrent.TorrentFile{
+		PieceLength: int64(m.pieceLength),
+		Length:      int64(m.totalLength),
+		Name:        m.outputName,
+		Files:       m.files,
+	}
+	pw, err := NewPieceWriter(outputPath, tf)
+	if err != nil {
+		return fmt.Errorf("creating piece writer: %w", err)
+	}
+	defer pw.Close()
 
 	workQueue := make(chan *PieceWork, m.totalPieces*16)
 
@@ -99,8 +116,9 @@ func (m *Manager) Download(outputPath string, infoHash [20]byte, peerID [20]byte
 		close(m.pieceResults)
 	}()
 
-	// Collector: read piece results and write to file
+	// Collector: read piece results, write to file, and track progress
 	completedPieces := 0
+
 	for result := range m.pieceResults {
 		if result.Err != nil {
 			return result.Err
@@ -108,6 +126,11 @@ func (m *Manager) Download(outputPath string, infoHash [20]byte, peerID [20]byte
 		if result.Index >= uint32(len(m.completed)) || m.completed[result.Index] {
 			continue
 		}
+
+		if err := pw.WritePiece(result.Index, result.Data); err != nil {
+			return fmt.Errorf("writing piece %d: %w", result.Index, err)
+		}
+
 		m.completed[result.Index] = true
 		completedPieces++
 		fmt.Printf("Progress %d/%d pieces (%.1f%%)\n",
@@ -207,7 +230,6 @@ func (m *Manager) assembleBlock(msg *peer.Message) {
 	// Check if the piece is complete (all blocks received)
 	if piece.receivedBlocks == piece.totalBlocks {
 		if m.verifyPiece(index, piece.data) {
-			m.completed[index] = true
 			delete(m.pendingPieces, index)
 			delete(m.inProgress, index)
 			m.pieceResults <- PieceResult{

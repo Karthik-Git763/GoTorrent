@@ -232,8 +232,9 @@ func TestAssembleBlock_CompletesPiece(t *testing.T) {
 	msg1 := makeBlockMessage(0, blockSize, blockSize, pieceData[blockSize:])
 	m.assembleBlock(msg1)
 
-	if !m.completed[0] {
-		t.Fatal("piece 0 should be completed after all blocks")
+	// Piece should NOT be marked completed (assembleBlock only sends to channel)
+	if m.completed[0] {
+		t.Fatal("assembleBlock should NOT mark piece as completed")
 	}
 
 	// Check the result was sent to pieceResults

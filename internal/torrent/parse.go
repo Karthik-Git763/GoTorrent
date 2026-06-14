@@ -6,6 +6,12 @@ import (
 	"go-torrent/internal/bencode"
 )
 
+// FileEntry represents a single file in a multi-file torrent.
+type FileEntry struct {
+	Length int64
+	Path   []string // path components relative to the torrent name
+}
+
 type TorrentFile struct {
 	Announce    string
 	InfoHash    [20]byte
@@ -13,6 +19,7 @@ type TorrentFile struct {
 	PieceLength int64
 	Length      int64
 	Name        string
+	Files       []FileEntry // non-nil for multi-file torrents; nil for single-file
 }
 
 func (tf *TorrentFile) Parse(rawTorrent []byte) error {
@@ -53,6 +60,12 @@ func (tf *TorrentFile) Parse(rawTorrent []byte) error {
 			return err
 		}
 		length = filesLength
+
+		entries, err := parseFileEntries(filesVal)
+		if err != nil {
+			return err
+		}
+		tf.Files = entries
 	}
 	name, ok := infoMap["name"].(string)
 	if !ok {
@@ -134,6 +147,34 @@ func sumFilesLength(files []any) (int64, error) {
 		total += lengthVal
 	}
 	return total, nil
+}
+
+func parseFileEntries(files []any) ([]FileEntry, error) {
+	entries := make([]FileEntry, 0, len(files))
+	for _, entry := range files {
+		fileMap, ok := entry.(map[string]any)
+		if !ok {
+			return nil, fmt.Errorf("invalid torrent: file entry not a dict")
+		}
+		lengthVal, ok := fileMap["length"].(int64)
+		if !ok {
+			return nil, fmt.Errorf("invalid torrent: file entry missing length")
+		}
+		pathVal, ok := fileMap["path"].([]any)
+		if !ok {
+			return nil, fmt.Errorf("invalid torrent: file entry missing path")
+		}
+		path := make([]string, len(pathVal))
+		for i, p := range pathVal {
+			s, ok := p.(string)
+			if !ok {
+				return nil, fmt.Errorf("invalid torrent: file path component not a string")
+			}
+			path[i] = s
+		}
+		entries = append(entries, FileEntry{Length: lengthVal, Path: path})
+	}
+	return entries, nil
 }
 
 func splitPieceHashes(pieces []byte) ([][20]byte, error) {

@@ -33,9 +33,10 @@ type PieceWriter struct {
 // torrent's full size so WriteAt works at any offset. When false, files
 // are created fresh with O_TRUNC.
 func NewPieceWriter(outputPath string, tf *torrent.TorrentFile, resume bool) (*PieceWriter, error) {
-	openFlags := os.O_CREATE | os.O_WRONLY | os.O_TRUNC
+	// Always use O_RDWR so the writer can also serve uploaded pieces.
+	openFlags := os.O_CREATE | os.O_RDWR | os.O_TRUNC
 	if resume {
-		// Preserve existing data for completed pieces
+		// Preserve existing data for completed pieces, no truncation
 		openFlags = os.O_CREATE | os.O_RDWR
 	}
 
@@ -141,6 +142,44 @@ func (pw *PieceWriter) WritePiece(index uint32, data []byte) error {
 		}
 	}
 	return nil
+}
+
+// ReadPiece reads a completed piece's data from the output file(s) at the
+// given piece index. This is the inverse of WritePiece — it reads from the
+// on-disk file(s) to serve upload requests from other peers.
+// The data slice must have the correct length for the piece.
+func (pw *PieceWriter) ReadPiece(index uint32, data []byte) (int, error) {
+	pieceOffset := int64(index) * pw.pieceLen
+	pieceEnd := pieceOffset + int64(len(data))
+
+	if pw.file != nil {
+		return pw.file.ReadAt(data, pieceOffset)
+	}
+
+	// Multi-file: read from overlapping files
+	total := 0
+	for i := range pw.entries {
+		fileStart := pw.fileOffsets[i]
+		fileEnd := fileStart + pw.entries[i].Length
+
+		overlapStart := max(pieceOffset, fileStart)
+		overlapEnd := min(pieceEnd, fileEnd)
+
+		if overlapStart >= overlapEnd {
+			continue
+		}
+
+		readAt := overlapStart - fileStart
+		dataStart := overlapStart - pieceOffset
+		dataLen := overlapEnd - overlapStart
+
+		n, err := pw.files[i].ReadAt(data[dataStart:dataStart+dataLen], readAt)
+		total += n
+		if err != nil {
+			return total, err
+		}
+	}
+	return total, nil
 }
 
 // Close closes all open files.

@@ -48,12 +48,10 @@ func ReadMessage(r io.Reader) (*Message, error) {
 		return nil, err
 	}
 
-	// Parse
-	msg := &Message{
+	return &Message{
 		ID:      MessageID(payloadBuf[0]),
 		Payload: payloadBuf[1:],
-	}
-	return msg, nil
+	}, nil
 }
 
 func WriteMessage(w io.Writer, msg *Message) error {
@@ -70,12 +68,44 @@ func ParseBitfield(payload []byte, totalPieces int) []bool {
 	bitfield := make([]bool, totalPieces)
 	for i := range totalPieces {
 		byteIndex := i / 8
-		bitIndex := 7 - (i % 8) // MSB  first!!
+		bitIndex := 7 - (i % 8) // MSB first
 		if byteIndex < len(payload) {
 			bitfield[i] = (payload[byteIndex]>>bitIndex)&1 == 1
-		} else {
-			bitfield[i] = false
 		}
 	}
 	return bitfield
+}
+
+// BuildBitfieldBytes encodes a bool slice into the wire-format byte slice.
+func BuildBitfieldBytes(bits []bool) []byte {
+	if len(bits) == 0 {
+		return nil
+	}
+	size := (len(bits) + 7) / 8
+	buf := make([]byte, size)
+	for i, set := range bits {
+		if !set {
+			continue
+		}
+		byteIndex := i / 8
+		bitIndex := 7 - (i % 8)
+		buf[byteIndex] |= 1 << bitIndex
+	}
+	return buf
+}
+
+// BuildPiece constructs a MsgPiece response for the given index, begin offset, and block data.
+func BuildPiece(index, begin uint32, data []byte) *Message {
+	payload := make([]byte, 8+len(data))
+	binary.BigEndian.PutUint32(payload[0:4], index)
+	binary.BigEndian.PutUint32(payload[4:8], begin)
+	copy(payload[8:], data)
+	return &Message{ID: MsgPiece, Payload: payload}
+}
+
+// BuildHave constructs a MsgHave for the given piece index.
+func BuildHave(index uint32) *Message {
+	payload := make([]byte, 4)
+	binary.BigEndian.PutUint32(payload, index)
+	return &Message{ID: MsgHave, Payload: payload}
 }

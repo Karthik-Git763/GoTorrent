@@ -45,10 +45,12 @@ type Manager struct {
 	// Resume support
 	savePath string         // path to .gtstate file (empty = no periodic saves)
 	infoHash [20]byte       // for matching saved state
+
+	// Upload support
+	pw *PieceWriter // set during Download for serving uploaded pieces
 }
 
 // NewManager creates a Manager ready to start downloading.
-// Only sets up metadata; call Download to run the full pipeline.
 func NewManager(torrent *torrent.TorrentFile, peers []*peer.PeerConnection) *Manager {
 	return &Manager{
 		totalPieces:  len(torrent.PieceHashes),
@@ -65,10 +67,11 @@ func NewManager(torrent *torrent.TorrentFile, peers []*peer.PeerConnection) *Man
 }
 
 // Download runs the full download pipeline:
-//  1. launch one worker goroutine per connected peer
-//  2. each worker independently selects pieces via RarestPiece/FirstPiece
-//  3. workers request blocks, assemble pieces, verify SHA1 hashes
-//  4. collector writes verified pieces to the output file(s)
+//  1. create the output file(s) and serve uploaded pieces from them
+//  2. launch one worker goroutine per connected peer
+//  3. each worker independently selects pieces via RarestPiece/FirstPiece
+//  4. workers request blocks, assemble pieces, verify SHA1 hashes
+//  5. collector writes verified pieces to the output file(s)
 //
 // When resume is true, the file writer preserves existing data and the
 // output is pre-allocated so WriteAt works at any offset. Already-completed
@@ -101,6 +104,10 @@ func (m *Manager) Download(outputPath string, resume bool) error {
 		return fmt.Errorf("creating piece writer: %w", err)
 	}
 	defer pw.Close()
+	m.pw = pw
+
+	// Set up upload handlers on all peers so they can request pieces from us.
+	m.initUpload()
 
 	// Workers: one per peer, each selecting and downloading pieces independently
 	var wg sync.WaitGroup
@@ -134,6 +141,10 @@ func (m *Manager) Download(outputPath string, resume bool) error {
 
 		m.completed[result.Index] = true
 		completedPieces++
+
+		// Announce the new piece to all connected peers so they can request it.
+		m.announceHave(result.Index)
+
 		fmt.Printf("Progress %d/%d pieces (%.1f%%)\n",
 			completedPieces, m.totalPieces,
 			float64(completedPieces)/float64(m.totalPieces)*100)
@@ -148,6 +159,59 @@ func (m *Manager) Download(outputPath string, resume bool) error {
 	}
 
 	return nil
+}
+
+// initUpload sets up upload handling on all peer connections:
+//  1. registers the getPieceData callback so the writer goroutine can
+//     respond to remote peer requests by reading from disk
+//  2. sends our bitfield to each peer so they know what pieces we have
+func (m *Manager) initUpload() {
+	bitfieldBytes := peer.BuildBitfieldBytes(m.completed)
+
+	for _, p := range m.peers {
+		p.SetPieceDataHandler(func(work peer.PieceWork) ([]byte, bool) {
+			m.mu.Lock()
+			completed := int(work.Index) < len(m.completed) && m.completed[work.Index]
+			m.mu.Unlock()
+
+			if !completed || m.pw == nil {
+				return nil, false
+			}
+
+			pieceSize := m.pieceLength
+			if int(work.Index) == m.totalPieces-1 {
+				pieceSize = m.totalLength - uint64(work.Index)*m.pieceLength
+			}
+
+			// Clamp length to piece boundary
+			length := work.Length
+			if uint64(work.Begin)+uint64(length) > pieceSize {
+				length = int(pieceSize - uint64(work.Begin))
+			}
+			if length <= 0 {
+				return nil, false
+			}
+
+			data := make([]byte, length)
+			n, err := m.pw.ReadPiece(uint32(work.Index), data)
+			if err != nil || n != len(data) {
+				return nil, false
+			}
+			return data, true
+		})
+
+		// Send our bitfield so the peer knows what we have.
+		if len(bitfieldBytes) > 0 {
+			p.SendBitfield(bitfieldBytes)
+		}
+	}
+}
+
+// announceHave sends a Have message to all connected peers when we complete a piece.
+func (m *Manager) announceHave(index uint32) {
+	for _, p := range m.peers {
+		p.SendHave(index)
+	}
 }
 
 // nextPiece selects the best eligible piece for the given peer using a
@@ -201,10 +265,7 @@ func (m *Manager) worker(p *peer.PeerConnection) {
 
 		// Verify SHA1 hash.
 		if !m.verifyPiece(uint32(idx), pieceData) {
-			// Corrupt piece — clear state and let nextPiece retry it.
 			m.markNotInProgress(uint32(idx))
-			// Clear completed flag if it was accidentally set (shouldn't happen,
-			// but be defensive).
 			continue
 		}
 
@@ -243,14 +304,13 @@ func (m *Manager) sendBlockRequests(p *peer.PeerConnection, idx, numBlocks int, 
 // collecting — if m.completed[idx] becomes true, we exit early.
 func (m *Manager) collectBlocks(p *peer.PeerConnection, idx int, pieceData []byte, numBlocks int) bool {
 	for remaining := numBlocks; remaining > 0; {
-		// Check if another peer already completed this piece (endgame).
 		if m.isCompleted(uint32(idx)) {
 			return false
 		}
 
 		msg := m.waitForPieceMessage(p)
 		if msg == nil {
-			return false // peer disconnected
+			return false
 		}
 
 		begin := binary.BigEndian.Uint32(msg.Payload[4:8])
@@ -294,7 +354,7 @@ func (m *Manager) verifyPiece(index uint32, data []byte) bool {
 	return bytes.Equal(hash[:], m.pieceHashes[index][:])
 }
 
-// --- Helpers ---
+// Helpers 
 
 func (m *Manager) isInProgress(index uint32) bool {
 	m.mu.Lock()
@@ -340,7 +400,6 @@ func (m *Manager) allCompleted() bool {
 }
 
 // SetCompleted overrides the completed bitfield with a saved state.
-// Only applies if the length matches; otherwise it's a no-op.
 func (m *Manager) SetCompleted(completed []bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()

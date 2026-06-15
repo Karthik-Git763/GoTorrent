@@ -43,12 +43,18 @@ piece.Manager → per-peer goroutines → rarest-first selection → endgame →
 
 ### How Downloads Work
 
-Each connected peer gets its own worker goroutine. Workers independently select which piece to download next using a two-tier strategy:
+Each connected peer gets its own worker goroutine with a reader/writer pair. Workers independently select which piece to download next using a two-tier strategy:
 
 1. **Rarest-first** — picks the piece with the fewest copies across all peers. Distributes load and preserves rare pieces.
 2. **First-piece fallback** — when all fresh pieces are claimed, picks any piece the peer has (even if another peer is already downloading it). This is the **endgame** — the last few pieces are requested from multiple peers simultaneously, eliminating slow-tail latency.
 
-Once a piece is selected, the worker pipelines all block requests (16 KiB each) to the peer, collects responses into a local buffer, verifies the SHA1 hash, and sends the verified result to the collector goroutine — which is the sole writer of the `completed` bitfield.
+Once a piece is selected, the worker pipelines all block requests (16 KiB each) to the peer, collects responses into a local buffer, verifies the SHA1 hash, and sends the verified result to the collector goroutine.
+
+### Upload / Seeding
+
+Peers are not just downloaders — they also upload. When a remote peer requests a block we have completed, the writer goroutine reads the piece data from disk and sends a piece response over the same TCP connection. Completed pieces are announced via Have messages to all connected peers, and our bitfield is broadcast at connection start so peers know what we can serve.
+
+On receiving an Interested message from a peer, we immediately Unchoke them — no complex unchoking algorithm. This makes us a cooperative leecher/seeder, improving our download speed as peers are more willing to reciprocate.
 
 ### Resume
 
@@ -86,6 +92,5 @@ The project uses table-driven subtests, `net.Pipe()` for in-memory protocol test
 - **uTP (BEP 29)** — UDP-based transport with latency-aware congestion control
 - **Rate limiting** — Per-peer and global bandwidth caps
 - **TUI (Bubble Tea)** — Terminal UI showing peers, progress, and speed in real time
-- **Seeding** — Upload completed pieces to other peers
 - **WebSeed (BEP 17/19)** — Download pieces over HTTP from static file hosts
 - **v2 torrents (BEP 52)** — Support for the BitTorrent v2 spec (SHA-256 hashes, merkle trees)

@@ -5,7 +5,8 @@ import (
 	"fmt"
 	"net/url"
 	"os"
-	"strings"
+	"os/signal"
+	"syscall"
 
 	"go-torrent/internal/peer"
 	"go-torrent/internal/piece"
@@ -21,11 +22,10 @@ func announceToTracker(announceURL string, infoHash [20]byte, peerID [20]byte, p
 		return nil, fmt.Errorf("parsing announce URL: %w", err)
 	}
 
-	switch strings.ToLower(parsed.Scheme) {
+	switch parsed.Scheme {
 	case "http", "https":
 		return tracker.AnnounceHTTP(announceURL, infoHash, peerID, port, totalLength)
 	case "udp":
-		// net.ResolveUDPAddr expects "host:port", not full URL
 		host := parsed.Host
 		return tracker.AnnounceUDP(host, infoHash, peerID, port, totalLength)
 	default:
@@ -67,7 +67,7 @@ func main() {
 	}
 
 	fmt.Printf("Announcing to tracker: %s\n", tf.Announce)
-		peers, err := announceToTracker(tf.Announce, tf.InfoHash, peerID, uint16(*port), tf.Length)
+	peers, err := announceToTracker(tf.Announce, tf.InfoHash, peerID, uint16(*port), tf.Length)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error announcing to tracker: %v\n", err)
 		os.Exit(1)
@@ -83,9 +83,45 @@ func main() {
 	fmt.Printf("Connected to %d peers\n", len(connections))
 
 	m := piece.NewManager(&tf, connections)
-	if err := m.Download(outputPath); err != nil {
+
+	// Try to resume from saved state
+	statePath := piece.StateFilePath(outputPath, tf.Name)
+	if state, err := piece.LoadResume(statePath, tf.InfoHash); err == nil {
+		completed := piece.CountCompleted(state.Completed)
+		fmt.Printf("Resuming from %d/%d completed pieces\n", completed, len(tf.PieceHashes))
+		m.SetCompleted(state.Completed)
+	} else if !os.IsNotExist(err) {
+		// State file exists but is invalid — start fresh
+		fmt.Printf("Warning: ignoring invalid resume state: %v\n", err)
+	}
+	fmt.Printf("Progress %d/%d pieces (%.1f%%)\n",
+		piece.CountCompleted(m.Completed()), len(tf.PieceHashes),
+		float64(piece.CountCompleted(m.Completed()))/float64(len(tf.PieceHashes))*100)
+
+	// Enable periodic saves during download
+	m.EnablePeriodicSave(statePath, tf.InfoHash)
+
+	// Signal handler for graceful shutdown (Ctrl+C)
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		<-sigCh
+		fmt.Println("\nSaving state and exiting...")
+		if err := piece.SaveResume(statePath, tf.InfoHash, m.Completed()); err != nil {
+			fmt.Fprintf(os.Stderr, "Error saving resume state: %v\n", err)
+		} else {
+			fmt.Printf("Resume state saved to %s\n", statePath)
+		}
+		os.Exit(0)
+	}()
+
+	if err := m.Download(outputPath, true); err != nil {
 		fmt.Fprintf(os.Stderr, "Download failed: %v\n", err)
+		// State was saved periodically — user can resume
 		os.Exit(1)
 	}
+
+	// Download complete — remove resume file
+	piece.RemoveResume(statePath)
 	fmt.Println("Download complete!")
 }

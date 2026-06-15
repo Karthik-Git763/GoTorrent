@@ -27,7 +27,18 @@ type PieceWriter struct {
 // For single-file torrents, opens one output file at outputPath/<Name>.
 // For multi-file torrents, creates the directory tree at outputPath/<Name>/
 // and opens all files.
-func NewPieceWriter(outputPath string, tf *torrent.TorrentFile) (*PieceWriter, error) {
+//
+// When resume is true, files are opened without truncation (existing data
+// is preserved for previously completed pieces) and pre-allocated to the
+// torrent's full size so WriteAt works at any offset. When false, files
+// are created fresh with O_TRUNC.
+func NewPieceWriter(outputPath string, tf *torrent.TorrentFile, resume bool) (*PieceWriter, error) {
+	openFlags := os.O_CREATE | os.O_WRONLY | os.O_TRUNC
+	if resume {
+		// Preserve existing data for completed pieces
+		openFlags = os.O_CREATE | os.O_RDWR
+	}
+
 	if len(tf.Files) == 0 {
 		// Single-file mode
 		fullPath := filepath.Join(outputPath, tf.Name)
@@ -35,9 +46,13 @@ func NewPieceWriter(outputPath string, tf *torrent.TorrentFile) (*PieceWriter, e
 		if err := os.MkdirAll(dir, 0755); err != nil {
 			return nil, fmt.Errorf("creating output directory: %w", err)
 		}
-		f, err := os.OpenFile(fullPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+		f, err := os.OpenFile(fullPath, openFlags, 0644)
 		if err != nil {
 			return nil, fmt.Errorf("opening output file %s: %w", fullPath, err)
+		}
+		if resume {
+			// Pre-allocate to the full torrent size so WriteAt works at any offset
+			_ = f.Truncate(tf.Length)
 		}
 		return &PieceWriter{
 			pieceLen: tf.PieceLength,
@@ -68,12 +83,15 @@ func NewPieceWriter(outputPath string, tf *torrent.TorrentFile) (*PieceWriter, e
 			}
 			return nil, fmt.Errorf("creating directory %s: %w", dir, err)
 		}
-		f, err := os.OpenFile(fullPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+		f, err := os.OpenFile(fullPath, openFlags, 0644)
 		if err != nil {
 			for j := range files[:i] {
 				files[j].Close()
 			}
 			return nil, fmt.Errorf("opening file %s: %w", fullPath, err)
+		}
+		if resume {
+			_ = f.Truncate(entry.Length)
 		}
 		files[i] = f
 	}

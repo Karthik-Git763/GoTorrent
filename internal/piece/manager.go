@@ -41,6 +41,10 @@ type Manager struct {
 
 	mu         sync.Mutex
 	inProgress map[uint32]bool
+
+	// Resume support
+	savePath string         // path to .gtstate file (empty = no periodic saves)
+	infoHash [20]byte       // for matching saved state
 }
 
 // NewManager creates a Manager ready to start downloading.
@@ -66,10 +70,23 @@ func NewManager(torrent *torrent.TorrentFile, peers []*peer.PeerConnection) *Man
 //  3. workers request blocks, assemble pieces, verify SHA1 hashes
 //  4. collector writes verified pieces to the output file(s)
 //
+// When resume is true, the file writer preserves existing data and the
+// output is pre-allocated so WriteAt works at any offset. Already-completed
+// pieces (from m.completed) are skipped.
+//
+// If EnablePeriodicSave was called before Download, the manager saves
+// progress periodically during the download.
+//
 // Blocks until all pieces are downloaded or an error occurs.
-func (m *Manager) Download(outputPath string) error {
+func (m *Manager) Download(outputPath string, resume bool) error {
 	if len(m.peers) == 0 {
 		return fmt.Errorf("no peers available")
+	}
+
+	// If all pieces already completed, nothing to do
+	if m.allCompleted() {
+		fmt.Printf("All %d pieces already completed\n", m.totalPieces)
+		return nil
 	}
 
 	// Create the piece writer for the output file(s)
@@ -79,7 +96,7 @@ func (m *Manager) Download(outputPath string) error {
 		Name:        m.outputName,
 		Files:       m.files,
 	}
-	pw, err := NewPieceWriter(outputPath, tf)
+	pw, err := NewPieceWriter(outputPath, tf, resume)
 	if err != nil {
 		return fmt.Errorf("creating piece writer: %w", err)
 	}
@@ -100,7 +117,8 @@ func (m *Manager) Download(outputPath string) error {
 	}()
 
 	// Collector: read piece results, write to file, and track progress
-	completedPieces := 0
+	completedPieces := CountCompleted(m.completed)
+	lastSaveCount := completedPieces
 
 	for result := range m.pieceResults {
 		if result.Err != nil {
@@ -119,6 +137,14 @@ func (m *Manager) Download(outputPath string) error {
 		fmt.Printf("Progress %d/%d pieces (%.1f%%)\n",
 			completedPieces, m.totalPieces,
 			float64(completedPieces)/float64(m.totalPieces)*100)
+
+		// Periodic state save
+		if m.savePath != "" && completedPieces-lastSaveCount >= saveInterval {
+			if err := SaveResume(m.savePath, m.infoHash, m.completed); err != nil {
+				fmt.Printf("Warning: failed to save resume state: %v\n", err)
+			}
+			lastSaveCount = completedPieces
+		}
 	}
 
 	return nil
@@ -299,4 +325,42 @@ func (m *Manager) isCompleted(index uint32) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return int(index) < len(m.completed) && m.completed[index]
+}
+
+// allCompleted returns true when every piece is marked done.
+func (m *Manager) allCompleted() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, c := range m.completed {
+		if !c {
+			return false
+		}
+	}
+	return true
+}
+
+// SetCompleted overrides the completed bitfield with a saved state.
+// Only applies if the length matches; otherwise it's a no-op.
+func (m *Manager) SetCompleted(completed []bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if len(completed) == len(m.completed) {
+		copy(m.completed, completed)
+	}
+}
+
+// Completed returns a copy of the completed bitfield for external save.
+func (m *Manager) Completed() []bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]bool, len(m.completed))
+	copy(out, m.completed)
+	return out
+}
+
+// EnablePeriodicSave sets the manager up to save progress to disk
+// every saveInterval completed pieces during Download.
+func (m *Manager) EnablePeriodicSave(savePath string, infoHash [20]byte) {
+	m.savePath = savePath
+	m.infoHash = infoHash
 }

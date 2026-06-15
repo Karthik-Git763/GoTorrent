@@ -27,14 +27,6 @@ type PieceResult struct {
 	Err   error
 }
 
-// PieceBuffer holds in-progress assembly of a single piece's blocks.
-type PieceBuffer struct {
-	index          uint32
-	data           []byte
-	receivedBlocks int
-	totalBlocks    int
-}
-
 // Manager orchestrates piece downloading across multiple peers.
 type Manager struct {
 	totalPieces  int
@@ -44,38 +36,35 @@ type Manager struct {
 	peers        []*peer.PeerConnection
 	completed    []bool
 	pieceResults chan PieceResult // workers -> manager collector
-	outputName   string           // torrent name for output files
+	outputName   string          // torrent name for output files
 	files        []torrent.FileEntry // multi-file entries (nil for single-file)
 
-	mu            sync.Mutex
-	pendingPieces map[uint32]*PieceBuffer
-	inProgress    map[uint32]bool
+	mu         sync.Mutex
+	inProgress map[uint32]bool
 }
 
 // NewManager creates a Manager ready to start downloading.
 // Only sets up metadata; call Download to run the full pipeline.
 func NewManager(torrent *torrent.TorrentFile, peers []*peer.PeerConnection) *Manager {
 	return &Manager{
-		totalPieces:   len(torrent.PieceHashes),
-		pieceLength:   uint64(torrent.PieceLength),
-		totalLength:   uint64(torrent.Length),
-		pieceHashes:   torrent.PieceHashes,
-		peers:         peers,
-		outputName:    torrent.Name,
-		files:         torrent.Files,
-		completed:     make([]bool, len(torrent.PieceHashes)),
-		pieceResults:  make(chan PieceResult, 32),
-		pendingPieces: make(map[uint32]*PieceBuffer),
-		inProgress:    make(map[uint32]bool),
+		totalPieces:  len(torrent.PieceHashes),
+		pieceLength:  uint64(torrent.PieceLength),
+		totalLength:  uint64(torrent.Length),
+		pieceHashes:  torrent.PieceHashes,
+		peers:        peers,
+		outputName:   torrent.Name,
+		files:        torrent.Files,
+		completed:    make([]bool, len(torrent.PieceHashes)),
+		pieceResults: make(chan PieceResult, 32),
+		inProgress:   make(map[uint32]bool),
 	}
 }
 
 // Download runs the full download pipeline:
-//  1. generate all block work items
-//  2. launch one worker goroutine per connected peer
-//  3. collect and assemble piece results
-//  4. verify each piece SHA1 hash
-//  5. write verified pieces to the output file(s)
+//  1. launch one worker goroutine per connected peer
+//  2. each worker independently selects pieces via RarestPiece/FirstPiece
+//  3. workers request blocks, assemble pieces, verify SHA1 hashes
+//  4. collector writes verified pieces to the output file(s)
 //
 // Blocks until all pieces are downloaded or an error occurs.
 func (m *Manager) Download(outputPath string) error {
@@ -96,21 +85,15 @@ func (m *Manager) Download(outputPath string) error {
 	}
 	defer pw.Close()
 
-	workQueue := make(chan *PieceWork, m.totalPieces*16)
-
-	// Producer: generate all block work items
-	go m.produceWork(workQueue)
-
-	// Consumers: one worker per peer
+	// Workers: one per peer, each selecting and downloading pieces independently
 	var wg sync.WaitGroup
 	for _, p := range m.peers {
 		wg.Go(func() {
-			m.worker(workQueue, p)
+			m.worker(p)
 		})
 	}
 
-	// Close work queue when all producers are done
-	// (workQueue is consumed by workers; we close when consumers finish)
+	// Close piece results when all workers exit
 	go func() {
 		wg.Wait()
 		close(m.pieceResults)
@@ -141,54 +124,129 @@ func (m *Manager) Download(outputPath string) error {
 	return nil
 }
 
-// produceWork generates all block-level work items and sends them to workQueue.
-// The last piece may be smaller than pieceLength.
-func (m *Manager) produceWork(workQueue chan<- *PieceWork) {
-	defer close(workQueue)
-	for i := 0; i < m.totalPieces; i++ {
+// nextPiece selects the best eligible piece for the given peer using a
+// two-tier strategy:
+//  1. RarestPiece
+//  2. FirstPiece
+// Returns -1 if no eligible piece exists for this peer.
+func (m *Manager) nextPiece(p *peer.PeerConnection) int {
+	idx := m.RarestPiece(p)
+	if idx != -1 {
+		return idx
+	}
+	return m.FirstPiece(p)
+}
+
+// worker selects pieces for its peer via nextPiece, then downloads all
+// blocks of each piece. It requests all blocks of a piece at once
+// (pipelining), collects the responses, verifies the SHA1 hash, and
+// sends the verified piece to pieceResults. On corruption it loops
+// back to re-select the piece; on disconnection it exits so the peer's
+// in-progress pieces become available to other workers.
+func (m *Manager) worker(p *peer.PeerConnection) {
+	for {
+		idx := m.nextPiece(p)
+		if idx == -1 {
+			return // no more work for this peer
+		}
+
 		pieceSize := m.pieceLength
-		if i == m.totalPieces-1 {
-			pieceSize = m.totalLength - uint64(i)*m.pieceLength
+		if int(idx) == m.totalPieces-1 {
+			pieceSize = m.totalLength - uint64(idx)*m.pieceLength
 		}
 		numBlocks := int((pieceSize + blockSize - 1) / blockSize)
-		for b := range numBlocks {
-			begin := int64(b) * blockSize
-			length := int64(blockSize)
-			if begin+length > int64(pieceSize) {
-				length = int64(pieceSize) - begin
-			}
-			workQueue <- &PieceWork{
-				Index:  uint32(i),
-				Begin:  uint32(begin),
-				Length: uint32(length),
-			}
+		pieceData := make([]byte, pieceSize)
+
+		m.markInProgress(uint32(idx))
+
+		// Pipeline: send all block requests for this piece to the peer.
+		ok := m.sendBlockRequests(p, idx, numBlocks, pieceSize)
+		if !ok {
+			m.markNotInProgress(uint32(idx))
+			return // peer choked or disconnected
+		}
+
+		// Collect all block responses.
+		ok = m.collectBlocks(p, idx, pieceData, numBlocks)
+		if !ok {
+			m.markNotInProgress(uint32(idx))
+			return // peer disconnected mid-piece
+		}
+
+		// Verify SHA1 hash.
+		if !m.verifyPiece(uint32(idx), pieceData) {
+			// Corrupt piece — clear state and let nextPiece retry it.
+			m.markNotInProgress(uint32(idx))
+			// Clear completed flag if it was accidentally set (shouldn't happen,
+			// but be defensive).
+			continue
+		}
+
+		m.pieceResults <- PieceResult{
+			Index: uint32(idx),
+			Data:  pieceData,
 		}
 	}
 }
 
-// worker pulls work from the shared queue and requests blocks from its peer.
-// It listens on the peer's Incoming channel for piece responses and feeds
-// them into the assembly pipeline.
-func (m *Manager) worker(workQueue <-chan *PieceWork, p *peer.PeerConnection) {
-	for work := range workQueue {
-		m.markInProgress(work.Index)
-
-		ok := p.AssignWork(peer.PieceWork{
-			Index:  int(work.Index),
-			Begin:  int(work.Begin),
-			Length: int(work.Length),
-		})
-		if !ok {
-			m.markNotInProgress(work.Index)
-			continue
+// sendBlockRequests sends all block requests for the given piece to the peer.
+// Returns false if the peer can't accept any request (choked/disconnected).
+func (m *Manager) sendBlockRequests(p *peer.PeerConnection, idx, numBlocks int, pieceSize uint64) bool {
+	for b := range numBlocks {
+		begin := int64(b) * blockSize
+		length := int64(blockSize)
+		if begin+length > int64(pieceSize) {
+			length = int64(pieceSize) - begin
 		}
 
-		// Wait for the corresponding piece message from this peer.
-		// We drain messages on Incoming() until we get a MsgPiece.
-		for msg := range p.Incoming() {
+		ok := p.AssignWork(peer.PieceWork{
+			Index:  int(idx),
+			Begin:  int(begin),
+			Length: int(length),
+		})
+		if !ok {
+			return false
+		}
+	}
+	return true
+}
+
+// collectBlocks reads responses from the peer until all blocks of the piece
+// are received. Returns false if the peer disconnects before completion.
+// In endgame mode, another peer may complete the same piece while we're
+// collecting — if m.completed[idx] becomes true, we exit early.
+func (m *Manager) collectBlocks(p *peer.PeerConnection, idx int, pieceData []byte, numBlocks int) bool {
+	for remaining := numBlocks; remaining > 0; {
+		// Check if another peer already completed this piece (endgame).
+		if m.isCompleted(uint32(idx)) {
+			return false
+		}
+
+		msg := m.waitForPieceMessage(p)
+		if msg == nil {
+			return false // peer disconnected
+		}
+
+		begin := binary.BigEndian.Uint32(msg.Payload[4:8])
+		blockData := msg.Payload[8:]
+		copy(pieceData[begin:], blockData)
+		remaining--
+	}
+	return true
+}
+
+// waitForPieceMessage reads from the peer's Incoming channel until a MsgPiece
+// is received, tracking Have messages along the way. Returns nil if the peer
+// disconnects before delivering the piece.
+func (m *Manager) waitForPieceMessage(p *peer.PeerConnection) *peer.Message {
+	for {
+		select {
+		case msg, ok := <-p.Incoming():
+			if !ok {
+				return nil
+			}
 			if msg.ID == peer.MsgPiece {
-				m.assembleBlock(msg)
-				break
+				return msg
 			}
 			// Track have messages to keep bitfield current.
 			if msg.ID == peer.MsgHave && len(msg.Payload) == 4 {
@@ -198,46 +256,8 @@ func (m *Manager) worker(workQueue <-chan *PieceWork, p *peer.PeerConnection) {
 					bf[idx] = true
 				}
 			}
-		}
-	}
-}
-
-// assembleBlock stores a received block and, when the piece is complete,
-// verifies its SHA1 hash and sends the result.
-func (m *Manager) assembleBlock(msg *peer.Message) {
-	// Payload: [4 bytes index][4 bytes begin][N bytes data]
-	index := binary.BigEndian.Uint32(msg.Payload[0:4])
-	begin := binary.BigEndian.Uint32(msg.Payload[4:8])
-	data := msg.Payload[8:]
-
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	piece := m.pendingPieces[index]
-	if piece == nil {
-		pieceSize := m.pieceLength
-		if int(index) == m.totalPieces-1 {
-			pieceSize = m.totalLength - uint64(index)*m.pieceLength
-		}
-		piece = newPieceBuffer(pieceSize)
-		piece.index = index
-		m.pendingPieces[index] = piece
-	}
-
-	copy(piece.data[begin:], data)
-	piece.receivedBlocks++
-
-	// Check if the piece is complete (all blocks received)
-	if piece.receivedBlocks == piece.totalBlocks {
-		if m.verifyPiece(index, piece.data) {
-			delete(m.pendingPieces, index)
-			delete(m.inProgress, index)
-			m.pieceResults <- PieceResult{
-				Index: index,
-				Data:  piece.data,
-			}
-		} else {
-			m.handleCorruptPiece(index)
+		case <-p.Done():
+			return nil
 		}
 	}
 }
@@ -248,28 +268,7 @@ func (m *Manager) verifyPiece(index uint32, data []byte) bool {
 	return bytes.Equal(hash[:], m.pieceHashes[index][:])
 }
 
-// handleCorruptPiece clears the corrupted piece state so it can be retried.
-func (m *Manager) handleCorruptPiece(index uint32) {
-	delete(m.pendingPieces, index)
-	delete(m.inProgress, index)
-
-	// Recreate the buffer for retry.
-	pieceSize := m.pieceLength
-	if int(index) == m.totalPieces-1 {
-		pieceSize = m.totalLength - uint64(index)*m.pieceLength
-	}
-	m.pendingPieces[index] = newPieceBuffer(pieceSize)
-}
-
-// newPieceBuffer allocates a PieceBuffer for the given piece size.
-func newPieceBuffer(pieceSize uint64) *PieceBuffer {
-	totalBlocks := int((pieceSize + blockSize - 1) / blockSize)
-	return &PieceBuffer{
-		data:           make([]byte, pieceSize),
-		totalBlocks:    totalBlocks,
-		receivedBlocks: 0,
-	}
-}
+// --- Helpers ---
 
 func (m *Manager) isInProgress(index uint32) bool {
 	m.mu.Lock()
@@ -299,5 +298,5 @@ func (m *Manager) markCompleted(index uint32) {
 func (m *Manager) isCompleted(index uint32) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	return m.completed[index]
+	return int(index) < len(m.completed) && m.completed[index]
 }

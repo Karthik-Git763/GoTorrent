@@ -184,3 +184,9 @@ func (pc *PeerConnection) Bitfield() []bool {
 func (pc *PeerConnection) Incoming() <-chan *Message {
 	return pc.incoming
 }
+
+// Done returns a channel that's closed when the peer connection is closed.
+// Workers can select on this alongside Incoming() to detect disconnection.
+func (pc *PeerConnection) Done() <-chan struct{} {
+	return pc.ctx.Done()
+}

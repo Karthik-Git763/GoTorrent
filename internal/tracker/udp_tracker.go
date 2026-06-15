@@ -249,3 +249,23 @@ func (t *UDPTracker) Close() error {
     }
     return nil
 }
+
+// AnnounceUDP sends an announce request to a UDP tracker and returns the list of peers.
+func AnnounceUDP(announceURL string, infoHash [20]byte, peerID [20]byte, port uint16, totalLength int64) ([]Peer, error) {
+	addr, err := net.ResolveUDPAddr("udp", announceURL)
+	if err != nil {
+		return nil, fmt.Errorf("resolving UDP tracker address: %w", err)
+	}
+
+	t := &UDPTracker{}
+	if _, err := t.Connect(addr); err != nil {
+		return nil, fmt.Errorf("connecting to UDP tracker: %w", err)
+	}
+	defer t.Close()
+
+	peers, _, err := t.Announce(infoHash, peerID, port, uint64(totalLength))
+	if err != nil {
+		return nil, fmt.Errorf("UDP tracker announce: %w", err)
+	}
+	return peers, nil
+}

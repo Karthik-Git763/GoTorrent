@@ -1,6 +1,6 @@
 # GoTorrent
 
-> A BitTorrent client built from scratch in Go. Standard library only — every protocol byte is handled explicitly. No frameworks, no external dependencies, just the wire protocol and Go's concurrency primitives.
+> A BitTorrent client built from scratch in Go. Core protocol logic is standard library only — every byte on the wire is handled explicitly. The TUI uses [Bubble Tea](https://github.com/charmbracelet/bubbletea) for the terminal interface.
 
 ![GoTorrent TUI](.docs/img/image.png)
 

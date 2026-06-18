@@ -1,6 +1,8 @@
 # GoTorrent
 
-A BitTorrent client built from scratch in Go. Standard library only — every protocol byte is handled explicitly. No frameworks, no external dependencies, just the wire protocol and Go's concurrency primitives.
+> A BitTorrent client built from scratch in Go. Standard library only — every protocol byte is handled explicitly. No frameworks, no external dependencies, just the wire protocol and Go's concurrency primitives.
+
+![GoTorrent TUI](.docs/img/image.png)
 
 ## Quick Start
 

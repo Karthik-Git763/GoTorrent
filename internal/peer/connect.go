@@ -77,7 +77,6 @@ func ConnectToPeers(torrent *torrent.TorrentFile, peers []tracker.Peer) []*PeerC
 			case msg := <-pc.Incoming():
 				if msg.ID == MsgBitfield {
 					pc.SetBitfield(ParseBitfield(msg.Payload, len(torrent.PieceHashes)))
-					fmt.Printf("Peer has %d pieces\n", countSetBits(pc.Bitfield()))
 				}
 			case <-time.After(10 * time.Second):
 				pc.Close()

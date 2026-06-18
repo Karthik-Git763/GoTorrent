@@ -5,6 +5,8 @@ import (
 	"crypto/sha1"
 	"encoding/binary"
 	"fmt"
+	"io"
+	"os"
 	"sync"
 
 	"go-torrent/internal/peer"
@@ -48,6 +50,9 @@ type Manager struct {
 
 	// Upload support
 	pw *PieceWriter // set during Download for serving uploaded pieces
+
+	// Status output
+	logWriter io.Writer // status messages (stderr by default, silenced in TUI mode)
 }
 
 // NewManager creates a Manager ready to start downloading.
@@ -63,6 +68,7 @@ func NewManager(torrent *torrent.TorrentFile, peers []*peer.PeerConnection) *Man
 		completed:    make([]bool, len(torrent.PieceHashes)),
 		pieceResults: make(chan PieceResult, 32),
 		inProgress:   make(map[uint32]bool),
+		logWriter:    os.Stderr,
 	}
 }
 
@@ -88,7 +94,7 @@ func (m *Manager) Download(outputPath string, resume bool) error {
 
 	// If all pieces already completed, nothing to do
 	if m.allCompleted() {
-		fmt.Printf("All %d pieces already completed\n", m.totalPieces)
+		fmt.Fprintf(m.logWriter, "All %d pieces already completed\n", m.totalPieces)
 		return nil
 	}
 
@@ -145,17 +151,22 @@ func (m *Manager) Download(outputPath string, resume bool) error {
 		// Announce the new piece to all connected peers so they can request it.
 		m.announceHave(result.Index)
 
-		fmt.Printf("Progress %d/%d pieces (%.1f%%)\n",
+		fmt.Fprintf(m.logWriter, "\rProgress %d/%d pieces (%.1f%%)  ",
 			completedPieces, m.totalPieces,
 			float64(completedPieces)/float64(m.totalPieces)*100)
 
 		// Periodic state save
 		if m.savePath != "" && completedPieces-lastSaveCount >= saveInterval {
 			if err := SaveResume(m.savePath, m.infoHash, m.completed); err != nil {
-				fmt.Printf("Warning: failed to save resume state: %v\n", err)
+				fmt.Fprintf(m.logWriter, "\nWarning: failed to save resume state: %v\n", err)
 			}
 			lastSaveCount = completedPieces
 		}
+	}
+
+	// Final newline so the shell prompt doesn't overwrite the progress line
+	if m.logWriter != nil {
+		fmt.Fprintln(m.logWriter)
 	}
 
 	return nil
@@ -408,6 +419,12 @@ func (m *Manager) SetCompleted(completed []bool) {
 	}
 }
 
+// SetLogWriter sets the writer for status/progress messages.
+// Pass io.Discard to silence all progress output (used in TUI mode).
+func (m *Manager) SetLogWriter(w io.Writer) {
+	m.logWriter = w
+}
+
 // Completed returns a copy of the completed bitfield for external save.
 func (m *Manager) Completed() []bool {
 	m.mu.Lock()
@@ -423,3 +440,15 @@ func (m *Manager) EnablePeriodicSave(savePath string, infoHash [20]byte) {
 	m.savePath = savePath
 	m.infoHash = infoHash
 }
+
+// TorrentName returns the torrent's display name.
+func (m *Manager) TorrentName() string { return m.outputName }
+
+// TotalPieces returns the total number of pieces in the torrent.
+func (m *Manager) TotalPieces() int { return m.totalPieces }
+
+// TotalLength returns the total size of the torrent in bytes.
+func (m *Manager) TotalLength() uint64 { return m.totalLength }
+
+// Peers returns the list of connected peer connections.
+func (m *Manager) Peers() []*peer.PeerConnection { return m.peers }

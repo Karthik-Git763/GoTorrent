@@ -272,3 +272,8 @@ func (pc *PeerConnection) Incoming() <-chan *Message {
 func (pc *PeerConnection) Done() <-chan struct{} {
 	return pc.ctx.Done()
 }
+
+// RemoteAddr returns the peer's IP:port as a string.
+func (pc *PeerConnection) RemoteAddr() string {
+	return pc.conn.RemoteAddr().String()
+}

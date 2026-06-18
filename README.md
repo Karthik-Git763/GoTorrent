@@ -96,3 +96,9 @@ The project uses table-driven subtests, `net.Pipe()` for in-memory protocol test
 - **Rate limiting** — Per-peer and global bandwidth caps
 - **WebSeed (BEP 17/19)** — Download pieces over HTTP from static file hosts
 - **v2 torrents (BEP 52)** — Support for the BitTorrent v2 spec (SHA-256 hashes, merkle trees)
+
+## License
+
+MIT © 2026 Karthik Das
+
+See [LICENSE.md](LICENSE.md) for the full text.

@@ -13,13 +13,14 @@ type FileEntry struct {
 }
 
 type TorrentFile struct {
-	Announce    string
-	InfoHash    [20]byte
-	PieceHashes [][20]byte
-	PieceLength int64
-	Length      int64
-	Name        string
-	Files       []FileEntry // non-nil for multi-file torrents; nil for single-file
+	Announce     string
+	AnnounceList []string // all tracker URLs (including the primary), for fallback
+	InfoHash     [20]byte
+	PieceHashes  [][20]byte
+	PieceLength  int64
+	Length       int64
+	Name         string
+	Files        []FileEntry
 }
 
 func (tf *TorrentFile) Parse(rawTorrent []byte) error {
@@ -33,11 +34,7 @@ func (tf *TorrentFile) Parse(rawTorrent []byte) error {
 		return fmt.Errorf("invalid torrent: expected top-level dict")
 	}
 
-	announce, ok := top["announce"].(string)
-	if !ok {
-		return fmt.Errorf("invalid torrent: missing announce")
-	}
-	tf.Announce = announce
+	tf.Announce, tf.AnnounceList = extractAnnounce(top)
 
 	infoRaw, infoMap, err := extractInfo(rawTorrent)
 	if err != nil {
@@ -87,6 +84,43 @@ func (tf *TorrentFile) Parse(rawTorrent []byte) error {
 	tf.PieceHashes = pieceHashes
 
 	return nil
+}
+
+// extractAnnounce tries announce → announce-list to find tracker URLs.
+// url-list (BEP 19 webseeds) is not used — those are file mirrors, not trackers.
+// Returns the primary announce URL and the full deduplicated list of all tracker URLs.
+func extractAnnounce(top map[string]any) (string, []string) {
+	announce := ""
+	if a, ok := top["announce"].(string); ok && a != "" {
+		announce = a
+	}
+
+	// Collect from announce-list (BEP 12)
+	seen := make(map[string]bool)
+	var all []string
+	if list, ok := top["announce-list"].([]any); ok {
+		for _, tier := range list {
+			group, ok := tier.([]any)
+			if !ok {
+				continue
+			}
+			for _, entry := range group {
+				s, ok := entry.(string)
+				if !ok || s == "" || seen[s] {
+					continue
+				}
+				seen[s] = true
+				all = append(all, s)
+			}
+		}
+	}
+
+	// Ensure primary announce is first in the list
+	if announce != "" && !seen[announce] {
+		all = append([]string{announce}, all...)
+	}
+
+	return announce, all
 }
 
 func extractInfo(rawTorrent []byte) ([]byte, map[string]any, error) {

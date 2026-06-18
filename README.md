@@ -8,10 +8,13 @@ A BitTorrent client built from scratch in Go. Standard library only — every pr
 # Build
 go build ./cmd/gotorrent/
 
-# Run
+# CLI mode — simple progress output
 ./gotorrent --output /downloads path/to/file.torrent
 
-# Resume an interrupted download (auto-detected)
+# TUI mode — real-time terminal UI with progress bar, piece map, peers
+./gotorrent --tui --output /downloads path/to/file.torrent
+
+# Resume an interrupted download (auto-detected in both modes)
 ./gotorrent --output /downloads path/to/file.torrent
 ```
 
@@ -91,6 +94,5 @@ The project uses table-driven subtests, `net.Pipe()` for in-memory protocol test
 - **Magnet links (BEP 9)** — Download without a `.torrent` file, using just an infohash
 - **uTP (BEP 29)** — UDP-based transport with latency-aware congestion control
 - **Rate limiting** — Per-peer and global bandwidth caps
-- **TUI (Bubble Tea)** — Terminal UI showing peers, progress, and speed in real time
 - **WebSeed (BEP 17/19)** — Download pieces over HTTP from static file hosts
 - **v2 torrents (BEP 52)** — Support for the BitTorrent v2 spec (SHA-256 hashes, merkle trees)

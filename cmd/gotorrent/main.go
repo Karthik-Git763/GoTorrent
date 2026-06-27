@@ -86,16 +86,23 @@ func run() error {
 		outputPath = "."
 	}
 
-	if len(tf.AnnounceList) == 0 {
-		return fmt.Errorf("torrent has no tracker announce URL; webseed-only torrents (BEP 19) are not yet supported")
-	}
-	if !*tuiMode {
-		fmt.Printf("Announcing to %d trackers...\n", len(tf.AnnounceList))
-		fmt.Fprintf(os.Stderr, "  primary: %s\n", tf.Announce)
-	}
-	peers, err := announceToTracker(tf.AnnounceList, tf.InfoHash, peerID, uint16(*port), tf.Length, *tuiMode)
-	if err != nil {
-		return fmt.Errorf("announcing to tracker: %w", err)
+	var peers []tracker.Peer
+	if len(tf.AnnounceList) > 0 {
+		if !*tuiMode {
+			fmt.Printf("Announcing to %d trackers...\n", len(tf.AnnounceList))
+			fmt.Fprintf(os.Stderr, "  primary: %s\n", tf.Announce)
+		}
+		peers, err = announceToTracker(tf.AnnounceList, tf.InfoHash, peerID, uint16(*port), tf.Length, *tuiMode)
+		if err != nil {
+			if len(tf.URLList) == 0 && len(tf.HTTPSeeds) == 0 {
+				return fmt.Errorf("announcing to tracker: %w", err)
+			}
+			if !*tuiMode {
+				fmt.Fprintf(os.Stderr, "Warning: tracker announce failed; falling back to webseeds: %v\n", err)
+			}
+		}
+	} else if len(tf.URLList) == 0 && len(tf.HTTPSeeds) == 0 {
+		return fmt.Errorf("torrent has no tracker announce URL or webseed URL")
 	}
 	if !*tuiMode {
 		fmt.Printf("Got %d peers from tracker\n", len(peers))
@@ -128,14 +135,14 @@ func run() error {
 	m.EnablePeriodicSave(statePath, tf.InfoHash)
 
 	if *tuiMode {
-			return runTUI(m, statePath, outputPath)
-		}
+		return runTUI(m, statePath, outputPath)
+	}
 
-		fmt.Printf("Progress %d/%d pieces (%.1f%%)\n",
-			piece.CountCompleted(m.Completed()), len(tf.PieceHashes),
-			float64(piece.CountCompleted(m.Completed()))/float64(len(tf.PieceHashes))*100)
+	fmt.Printf("Progress %d/%d pieces (%.1f%%)\n",
+		piece.CountCompleted(m.Completed()), len(tf.PieceHashes),
+		float64(piece.CountCompleted(m.Completed()))/float64(len(tf.PieceHashes))*100)
 
-		// Signal handler for graceful shutdown (CLI mode only)
+	// Signal handler for graceful shutdown (CLI mode only)
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	go func() {

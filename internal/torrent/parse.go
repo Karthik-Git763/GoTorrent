@@ -15,6 +15,8 @@ type FileEntry struct {
 type TorrentFile struct {
 	Announce     string
 	AnnounceList []string // all tracker URLs (including the primary), for fallback
+	URLList      []string // BEP 19 webseed URLs
+	HTTPSeeds    []string // BEP 17 HTTP seed script URLs
 	InfoHash     [20]byte
 	PieceHashes  [][20]byte
 	PieceLength  int64
@@ -35,6 +37,8 @@ func (tf *TorrentFile) Parse(rawTorrent []byte) error {
 	}
 
 	tf.Announce, tf.AnnounceList = extractAnnounce(top)
+	tf.URLList = extractStringOrList(top, "url-list")
+	tf.HTTPSeeds = extractStringList(top, "httpseeds")
 
 	infoRaw, infoMap, err := extractInfo(rawTorrent)
 	if err != nil {
@@ -46,9 +50,20 @@ func (tf *TorrentFile) Parse(rawTorrent []byte) error {
 	if !ok {
 		return fmt.Errorf("invalid torrent: missing piece length")
 	}
-	length, ok := infoMap["length"].(int64)
-	if !ok {
-		filesVal, hasFiles := infoMap["files"].([]any)
+	if pieceLength <= 0 {
+		return fmt.Errorf("invalid torrent: piece length must be positive")
+	}
+
+	length, hasLength := infoMap["length"].(int64)
+	filesVal, hasFiles := infoMap["files"].([]any)
+	if hasLength && hasFiles {
+		return fmt.Errorf("invalid torrent: both length and files present")
+	}
+	if hasLength {
+		if length < 0 {
+			return fmt.Errorf("invalid torrent: negative length")
+		}
+	} else {
 		if !hasFiles {
 			return fmt.Errorf("invalid torrent: missing length")
 		}
@@ -68,6 +83,9 @@ func (tf *TorrentFile) Parse(rawTorrent []byte) error {
 	if !ok {
 		return fmt.Errorf("invalid torrent: missing name")
 	}
+	if name == "" {
+		return fmt.Errorf("invalid torrent: empty name")
+	}
 	piecesStr, ok := infoMap["pieces"].(string)
 	if !ok {
 		return fmt.Errorf("invalid torrent: missing pieces")
@@ -76,6 +94,13 @@ func (tf *TorrentFile) Parse(rawTorrent []byte) error {
 	pieceHashes, err := splitPieceHashes([]byte(piecesStr))
 	if err != nil {
 		return err
+	}
+	expectedPieces := int((length + pieceLength - 1) / pieceLength)
+	if expectedPieces == 0 && length == 0 {
+		expectedPieces = 0
+	}
+	if len(pieceHashes) != expectedPieces {
+		return fmt.Errorf("invalid torrent: pieces count %d does not match length %d and piece length %d", len(pieceHashes), length, pieceLength)
 	}
 
 	tf.PieceLength = pieceLength
@@ -87,7 +112,7 @@ func (tf *TorrentFile) Parse(rawTorrent []byte) error {
 }
 
 // extractAnnounce tries announce → announce-list to find tracker URLs.
-// url-list (BEP 19 webseeds) is not used — those are file mirrors, not trackers.
+// url-list (BEP 19 webseeds) is intentionally separate from tracker URLs.
 // Returns the primary announce URL and the full deduplicated list of all tracker URLs.
 func extractAnnounce(top map[string]any) (string, []string) {
 	announce := ""
@@ -121,6 +146,31 @@ func extractAnnounce(top map[string]any) (string, []string) {
 	}
 
 	return announce, all
+}
+
+func extractStringOrList(top map[string]any, key string) []string {
+	if s, ok := top[key].(string); ok && s != "" {
+		return []string{s}
+	}
+	return extractStringList(top, key)
+}
+
+func extractStringList(top map[string]any, key string) []string {
+	list, ok := top[key].([]any)
+	if !ok {
+		return nil
+	}
+	seen := make(map[string]bool)
+	out := make([]string, 0, len(list))
+	for _, entry := range list {
+		s, ok := entry.(string)
+		if !ok || s == "" || seen[s] {
+			continue
+		}
+		seen[s] = true
+		out = append(out, s)
+	}
+	return out
 }
 
 func extractInfo(rawTorrent []byte) ([]byte, map[string]any, error) {
@@ -198,11 +248,17 @@ func parseFileEntries(files []any) ([]FileEntry, error) {
 		if !ok {
 			return nil, fmt.Errorf("invalid torrent: file entry missing path")
 		}
+		if len(pathVal) == 0 {
+			return nil, fmt.Errorf("invalid torrent: empty file path")
+		}
 		path := make([]string, len(pathVal))
 		for i, p := range pathVal {
 			s, ok := p.(string)
 			if !ok {
 				return nil, fmt.Errorf("invalid torrent: file path component not a string")
+			}
+			if s == "" {
+				return nil, fmt.Errorf("invalid torrent: empty file path component")
 			}
 			path[i] = s
 		}

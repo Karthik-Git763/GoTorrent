@@ -2,6 +2,7 @@ package peer
 
 import (
 	"crypto/rand"
+	"encoding/binary"
 	"fmt"
 	"net"
 	"sync"
@@ -72,15 +73,21 @@ func ConnectToPeers(torrent *torrent.TorrentFile, peers []tracker.Peer) []*PeerC
 			pc := NewPeerConnection(conn, remoteID)
 			pc.Start()
 
-			// Read initial bitfield (first message after handshake)
+			// Read an optional initial bitfield. BEP 3 peers with no pieces may skip it.
+			pc.SetBitfield(make([]bool, len(torrent.PieceHashes)))
 			select {
 			case msg := <-pc.Incoming():
 				if msg.ID == MsgBitfield {
 					pc.SetBitfield(ParseBitfield(msg.Payload, len(torrent.PieceHashes)))
+				} else if msg.ID == MsgHave && len(msg.Payload) == 4 {
+					idx := binary.BigEndian.Uint32(msg.Payload)
+					bf := pc.Bitfield()
+					if int(idx) < len(bf) {
+						bf[idx] = true
+					}
 				}
 			case <-time.After(10 * time.Second):
-				pc.Close()
-				return // no bitfield within 10s, skip peer
+				// No bitfield is valid; continue and learn availability from Have.
 			}
 
 			// Send Interested

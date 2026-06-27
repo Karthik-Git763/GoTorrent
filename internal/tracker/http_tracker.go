@@ -7,7 +7,6 @@ import (
 	"net"
 	"net/http"
 	"net/url"
-	"strings"
 
 	"go-torrent/internal/bencode"
 )
@@ -26,8 +25,8 @@ func AnnounceHTTP(announceURL string, infoHash [20]byte, peerID [20]byte, port u
 	}
 	// Set the query parameters
 	query := parsedURL.Query()
-	query.Set("info_hash", escapeBytes(infoHash[:]))
-	query.Set("peer_id", escapeBytes(peerID[:]))
+	query.Set("info_hash", string(infoHash[:]))
+	query.Set("peer_id", string(peerID[:]))
 	query.Set("port", fmt.Sprintf("%d", port))
 	query.Set("uploaded", "0")
 	query.Set("downloaded", "0")
@@ -57,7 +56,7 @@ func parseHTTPResponse(body []byte) ([]Peer, error) {
 	if err != nil {
 		return nil, err
 	}
-	
+
 	// Check the response type
 	top, ok := decoded.(map[string]any)
 	if !ok {
@@ -72,7 +71,7 @@ func parseHTTPResponse(body []byte) ([]Peer, error) {
 	if !ok {
 		return nil, fmt.Errorf("invalid tracker response: missing peers")
 	}
-	
+
 	// Unmarshal the peers based on their type
 	switch peers := peersVal.(type) {
 	case string:
@@ -119,19 +118,4 @@ func unmarshalPeerList(peersList []any) ([]Peer, error) {
 		peers = append(peers, Peer{IP: net.ParseIP(ipStr), Port: uint16(portVal)})
 	}
 	return peers, nil
-}
-
-// escapeBytes escapes special characters in a byte slice for use in URLs.
-func escapeBytes(b []byte) string {
-	var sb strings.Builder
-	for _, c := range b {
-		if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-' || c == '.' || c == '_' || c == '~' {
-			sb.WriteByte(c)
-			continue
-		}
-		sb.WriteByte('%')
-		sb.WriteByte("0123456789ABCDEF"[c>>4])
-		sb.WriteByte("0123456789ABCDEF"[c&0x0F])
-	}
-	return sb.String()
 }

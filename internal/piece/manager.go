@@ -2,6 +2,7 @@ package piece
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha1"
 	"encoding/binary"
 	"fmt"
@@ -11,6 +12,7 @@ import (
 
 	"go-torrent/internal/peer"
 	"go-torrent/internal/torrent"
+	"go-torrent/internal/webseed"
 )
 
 const blockSize = 16 * 1024 // 16KB
@@ -36,17 +38,18 @@ type Manager struct {
 	totalLength  uint64
 	pieceHashes  [][20]byte
 	peers        []*peer.PeerConnection
+	webseeds     []webseed.Source
 	completed    []bool
-	pieceResults chan PieceResult // workers -> manager collector
-	outputName   string          // torrent name for output files
+	pieceResults chan PieceResult    // workers -> manager collector
+	outputName   string              // torrent name for output files
 	files        []torrent.FileEntry // multi-file entries (nil for single-file)
 
 	mu         sync.Mutex
 	inProgress map[uint32]bool
 
 	// Resume support
-	savePath string         // path to .gtstate file (empty = no periodic saves)
-	infoHash [20]byte       // for matching saved state
+	savePath string   // path to .gtstate file (empty = no periodic saves)
+	infoHash [20]byte // for matching saved state
 
 	// Upload support
 	pw *PieceWriter // set during Download for serving uploaded pieces
@@ -63,6 +66,7 @@ func NewManager(torrent *torrent.TorrentFile, peers []*peer.PeerConnection) *Man
 		totalLength:  uint64(torrent.Length),
 		pieceHashes:  torrent.PieceHashes,
 		peers:        peers,
+		webseeds:     webseed.NewSources(torrent),
 		outputName:   torrent.Name,
 		files:        torrent.Files,
 		completed:    make([]bool, len(torrent.PieceHashes)),
@@ -88,8 +92,11 @@ func NewManager(torrent *torrent.TorrentFile, peers []*peer.PeerConnection) *Man
 //
 // Blocks until all pieces are downloaded or an error occurs.
 func (m *Manager) Download(outputPath string, resume bool) error {
+	if len(m.peers) == 0 && len(m.webseeds) == 0 {
+		return fmt.Errorf("no peers or webseeds available")
+	}
 	if len(m.peers) == 0 {
-		return fmt.Errorf("no peers available")
+		fmt.Fprintf(m.logWriter, "No peers available; using %d webseed(s)\n", len(m.webseeds))
 	}
 
 	// If all pieces already completed, nothing to do
@@ -115,11 +122,19 @@ func (m *Manager) Download(outputPath string, resume bool) error {
 	// Set up upload handlers on all peers so they can request pieces from us.
 	m.initUpload()
 
-	// Workers: one per peer, each selecting and downloading pieces independently
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Workers: one per peer and one per webseed, sharing the same collector.
 	var wg sync.WaitGroup
 	for _, p := range m.peers {
 		wg.Go(func() {
 			m.worker(p)
+		})
+	}
+	for _, source := range m.webseeds {
+		wg.Go(func() {
+			m.webseedWorker(ctx, source)
 		})
 	}
 
@@ -135,6 +150,7 @@ func (m *Manager) Download(outputPath string, resume bool) error {
 
 	for result := range m.pieceResults {
 		if result.Err != nil {
+			cancel()
 			return result.Err
 		}
 		if result.Index >= uint32(len(m.completed)) || m.completed[result.Index] {
@@ -169,6 +185,9 @@ func (m *Manager) Download(outputPath string, resume bool) error {
 		fmt.Fprintln(m.logWriter)
 	}
 
+	if !m.allCompleted() {
+		return fmt.Errorf("download incomplete: completed %d/%d pieces", CountCompleted(m.completed), m.totalPieces)
+	}
 	return nil
 }
 
@@ -189,10 +208,7 @@ func (m *Manager) initUpload() {
 				return nil, false
 			}
 
-			pieceSize := m.pieceLength
-			if int(work.Index) == m.totalPieces-1 {
-				pieceSize = m.totalLength - uint64(work.Index)*m.pieceLength
-			}
+			pieceSize := m.sizeOfPiece(work.Index)
 
 			// Clamp length to piece boundary
 			length := work.Length
@@ -229,6 +245,7 @@ func (m *Manager) announceHave(index uint32) {
 // two-tier strategy:
 //  1. RarestPiece
 //  2. FirstPiece
+//
 // Returns -1 if no eligible piece exists for this peer.
 func (m *Manager) nextPiece(p *peer.PeerConnection) int {
 	idx := m.RarestPiece(p)
@@ -251,10 +268,7 @@ func (m *Manager) worker(p *peer.PeerConnection) {
 			return // no more work for this peer
 		}
 
-		pieceSize := m.pieceLength
-		if int(idx) == m.totalPieces-1 {
-			pieceSize = m.totalLength - uint64(idx)*m.pieceLength
-		}
+		pieceSize := m.sizeOfPiece(idx)
 		numBlocks := int((pieceSize + blockSize - 1) / blockSize)
 		pieceData := make([]byte, pieceSize)
 
@@ -287,6 +301,68 @@ func (m *Manager) worker(p *peer.PeerConnection) {
 	}
 }
 
+func (m *Manager) webseedWorker(ctx context.Context, source webseed.Source) {
+	for {
+		idx := m.nextWebSeedPiece()
+		if idx == -1 {
+			return
+		}
+
+		pieceSize := m.sizeOfPiece(idx)
+		data, err := source.FetchPiece(ctx, uint32(idx), int64(pieceSize))
+		if err != nil {
+			m.markNotInProgress(uint32(idx))
+			return
+		}
+		if !m.verifyPiece(uint32(idx), data) {
+			source.Disable()
+			m.markNotInProgress(uint32(idx))
+			return
+		}
+
+		select {
+		case m.pieceResults <- PieceResult{Index: uint32(idx), Data: data}:
+		case <-ctx.Done():
+			m.markNotInProgress(uint32(idx))
+			return
+		}
+	}
+}
+
+func (m *Manager) sizeOfPiece(idx int) uint64 {
+	pieceSize := m.pieceLength
+	if idx == m.totalPieces-1 {
+		pieceSize = m.totalLength - uint64(idx)*m.pieceLength
+	}
+	return pieceSize
+}
+
+// nextWebSeedPiece chooses the first piece in the largest contiguous missing
+// run. This keeps HTTP webseed reads more sequential than peer rarest-first.
+func (m *Manager) nextWebSeedPiece() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	bestStart, bestLen := -1, 0
+	for i := 0; i < m.totalPieces; {
+		for i < m.totalPieces && (m.completed[i] || m.inProgress[uint32(i)]) {
+			i++
+		}
+		start := i
+		for i < m.totalPieces && !m.completed[i] && !m.inProgress[uint32(i)] {
+			i++
+		}
+		if runLen := i - start; runLen > bestLen {
+			bestStart, bestLen = start, runLen
+		}
+	}
+	if bestStart == -1 {
+		return -1
+	}
+	m.inProgress[uint32(bestStart)] = true
+	return bestStart
+}
+
 // sendBlockRequests sends all block requests for the given piece to the peer.
 // Returns false if the peer can't accept any request (choked/disconnected).
 func (m *Manager) sendBlockRequests(p *peer.PeerConnection, idx, numBlocks int, pieceSize uint64) bool {
@@ -314,6 +390,7 @@ func (m *Manager) sendBlockRequests(p *peer.PeerConnection, idx, numBlocks int, 
 // In endgame mode, another peer may complete the same piece while we're
 // collecting — if m.completed[idx] becomes true, we exit early.
 func (m *Manager) collectBlocks(p *peer.PeerConnection, idx int, pieceData []byte, numBlocks int) bool {
+	received := make(map[uint32]bool, numBlocks)
 	for remaining := numBlocks; remaining > 0; {
 		if m.isCompleted(uint32(idx)) {
 			return false
@@ -324,9 +401,33 @@ func (m *Manager) collectBlocks(p *peer.PeerConnection, idx int, pieceData []byt
 			return false
 		}
 
+		if len(msg.Payload) < 8 {
+			return false
+		}
+		msgIndex := binary.BigEndian.Uint32(msg.Payload[0:4])
+		if msgIndex != uint32(idx) {
+			return false
+		}
 		begin := binary.BigEndian.Uint32(msg.Payload[4:8])
 		blockData := msg.Payload[8:]
+		if int(begin) >= len(pieceData) || int(begin)+len(blockData) > len(pieceData) {
+			return false
+		}
+		if begin%blockSize != 0 {
+			return false
+		}
+		if received[begin] {
+			continue
+		}
+		expected := blockSize
+		if int(begin)+expected > len(pieceData) {
+			expected = len(pieceData) - int(begin)
+		}
+		if len(blockData) != expected {
+			return false
+		}
 		copy(pieceData[begin:], blockData)
+		received[begin] = true
 		remaining--
 	}
 	return true
@@ -365,7 +466,7 @@ func (m *Manager) verifyPiece(index uint32, data []byte) bool {
 	return bytes.Equal(hash[:], m.pieceHashes[index][:])
 }
 
-// Helpers 
+// Helpers
 
 func (m *Manager) isInProgress(index uint32) bool {
 	m.mu.Lock()

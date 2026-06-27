@@ -1,11 +1,31 @@
 package piece
 
 import (
+	"context"
 	"crypto/sha1"
+	"io"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"go-torrent/internal/peer"
+	"go-torrent/internal/torrent"
+	"go-torrent/internal/webseed"
 )
+
+type fakeWebSeed struct {
+	pieces map[uint32][]byte
+}
+
+func (f *fakeWebSeed) Name() string { return "fake" }
+func (f *fakeWebSeed) FetchPiece(ctx context.Context, index uint32, length int64) ([]byte, error) {
+	data := f.pieces[index]
+	out := make([]byte, len(data))
+	copy(out, data)
+	return out, nil
+}
+func (f *fakeWebSeed) Disable()        {}
+func (f *fakeWebSeed) Available() bool { return true }
 
 // VerifyPiece Tests
 
@@ -54,6 +74,38 @@ func TestVerifyPiece_MultiplePieces(t *testing.T) {
 	}
 	if m.verifyPiece(0, data1) {
 		t.Fatal("piece 0 should NOT match data1's hash")
+	}
+}
+
+func TestDownloadWebSeedOnly(t *testing.T) {
+	piece0 := []byte("abcd")
+	piece1 := []byte("ef")
+	hash0 := sha1.Sum(piece0)
+	hash1 := sha1.Sum(piece1)
+
+	tf := &torrent.TorrentFile{
+		Name:        "out.bin",
+		Length:      6,
+		PieceLength: 4,
+		PieceHashes: [][20]byte{hash0, hash1},
+	}
+	m := NewManager(tf, nil)
+	m.webseeds = []webseed.Source{&fakeWebSeed{pieces: map[uint32][]byte{
+		0: piece0,
+		1: piece1,
+	}}}
+	m.SetLogWriter(io.Discard)
+
+	dir := t.TempDir()
+	if err := m.Download(dir, true); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(filepath.Join(dir, "out.bin"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "abcdef" {
+		t.Fatalf("file = %q, want abcdef", data)
 	}
 }
 
@@ -223,9 +275,9 @@ func TestNextPiece_EndgameSelectsInProgress(t *testing.T) {
 
 func TestMarkers(t *testing.T) {
 	m := &Manager{
-		totalPieces:  3,
-		completed:    make([]bool, 3),
-		inProgress:   make(map[uint32]bool),
+		totalPieces: 3,
+		completed:   make([]bool, 3),
+		inProgress:  make(map[uint32]bool),
 	}
 
 	if m.isCompleted(0) {

@@ -46,7 +46,7 @@ func TestAnnounceHTTPWithTorrentFile(t *testing.T) {
 	for _, trackerURL := range trackers {
 		peers, err := AnnounceHTTP(trackerURL, tf.InfoHash, peerID, 6881, tf.Length)
 		if err != nil {
-			if isNetworkError(err) || isNonBencodedResponse(err) {
+			if isNetworkError(err) || isUnavailableTrackerResponse(err) {
 				lastErr = err
 				continue
 			}
@@ -77,6 +77,7 @@ func isNetworkError(err error) bool {
 	return false
 }
 
-func isNonBencodedResponse(err error) bool {
-	return strings.Contains(err.Error(), "unknown type: <")
+func isUnavailableTrackerResponse(err error) bool {
+	return strings.Contains(err.Error(), "unknown type: <") ||
+		strings.Contains(err.Error(), "tracker returned HTTP")
 }

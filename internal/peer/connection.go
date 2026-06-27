@@ -15,17 +15,17 @@ const defaultTimeout = 30 * time.Second
 // goroutine pair. Supports both downloading (requesting blocks) and uploading
 // (responding to peer requests).
 type PeerConnection struct {
-	conn   net.Conn
-	peerID [20]byte
-	choked atomic.Bool
-	bitfield []bool
-	incoming   chan *Message  // reader -> manager (wire messages except requests)
-	pieceQueue chan PieceWork // manager -> writer (download requests to send)
+	conn          net.Conn
+	peerID        [20]byte
+	choked        atomic.Bool
+	bitfield      []bool
+	incoming      chan *Message  // reader -> manager (wire messages except requests)
+	pieceQueue    chan PieceWork // manager -> writer (download requests to send)
 	pieceRequests chan PieceWork // reader -> writer (upload requests from remote peer)
-	outgoing     chan *Message  // manager/reader -> writer (control messages: unchoke, have, bitfield)
-	ctx context.Context
-	cancel context.CancelFunc
-	closeOnce sync.Once
+	outgoing      chan *Message  // manager/reader -> writer (control messages: unchoke, have, bitfield)
+	ctx           context.Context
+	cancel        context.CancelFunc
+	closeOnce     sync.Once
 
 	// Choked wait: writer parks here when choked, reader signals on unchoke
 	unchokeMu   sync.Mutex
@@ -44,14 +44,14 @@ type PieceWork struct {
 func NewPeerConnection(conn net.Conn, peerID [20]byte) *PeerConnection {
 	ctx, cancel := context.WithCancel(context.Background())
 	pc := &PeerConnection{
-		conn:           conn,
-		peerID:         peerID,
-		incoming:       make(chan *Message, 100),
-		pieceQueue:     make(chan PieceWork, 10),
-		pieceRequests:  make(chan PieceWork, 10),
-		outgoing:       make(chan *Message, 10),
-		ctx:            ctx,
-		cancel:         cancel,
+		conn:          conn,
+		peerID:        peerID,
+		incoming:      make(chan *Message, 100),
+		pieceQueue:    make(chan PieceWork, 10),
+		pieceRequests: make(chan PieceWork, 10),
+		outgoing:      make(chan *Message, 10),
+		ctx:           ctx,
+		cancel:        cancel,
 	}
 	pc.choked.Store(true)
 	pc.unchokeCond = sync.NewCond(&pc.unchokeMu)
@@ -70,7 +70,7 @@ func (pc *PeerConnection) reader() {
 		if err := pc.conn.SetReadDeadline(time.Now().Add(defaultTimeout)); err != nil {
 			return
 		}
-		
+
 		// Read data
 		msg, err := ReadMessage(pc.conn)
 		if err != nil {
@@ -159,6 +159,17 @@ func (pc *PeerConnection) SendBitfield(bits []byte) {
 	select {
 	case pc.outgoing <- &Message{ID: MsgBitfield, Payload: bits}:
 	case <-pc.ctx.Done():
+	}
+}
+
+// SendInterested queues an Interested message through the connection's single
+// writer goroutine. It returns false when the connection is already closed.
+func (pc *PeerConnection) SendInterested() bool {
+	select {
+	case pc.outgoing <- &Message{ID: MsgInterested}:
+		return true
+	case <-pc.ctx.Done():
+		return false
 	}
 }
 

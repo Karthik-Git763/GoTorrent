@@ -8,8 +8,8 @@ import (
 
 	"go-torrent/internal/piece"
 
-	"github.com/charmbracelet/bubbles/progress"
 	tea "charm.land/bubbletea/v2"
+	"github.com/charmbracelet/bubbles/progress"
 	"github.com/charmbracelet/lipgloss"
 )
 
@@ -19,22 +19,26 @@ type TickMsg struct{}
 // DownloadDoneMsg signals the download finished.
 type DownloadDoneMsg struct{ Err error }
 
+type transferSample struct {
+	at    time.Time
+	bytes uint64
+}
+
 // Model is the Bubble Tea model for the GoTorrent TUI.
 type Model struct {
-	m       *piece.Manager
-	width   int
-	height  int
-	ready   bool
-	percent float64 // 0.0 – 1.0, set every tick
+	m        *piece.Manager
+	width    int
+	height   int
+	ready    bool
+	percent  float64 // 0.0 – 1.0, set every tick
 	progress progress.Model
-	done    bool
-	err     error
-	doneCh  <-chan error // closed when download completes
+	done     bool
+	err      error
+	doneCh   <-chan error // closed when download completes
 
 	// Speed tracking
-	lastBytes    int64
-	lastTime     time.Time
-	downloadRate float64 // bytes/sec
+	transferSamples []transferSample
+	downloadRate    float64 // bytes/sec
 
 	// Piece map cache
 	pieceMapWidth int
@@ -43,11 +47,11 @@ type Model struct {
 // NewModel creates a new TUI model.
 func NewModel(m *piece.Manager, doneCh <-chan error) Model {
 	return Model{
-		m:          m,
-		doneCh:     doneCh,
-		lastTime:   time.Now(),
-		pieceMapWidth: 60,
-		progress:   progress.New(progress.WithSolidFill("#22C55E"), progress.WithoutPercentage()),
+		m:               m,
+		doneCh:          doneCh,
+		transferSamples: []transferSample{{at: time.Now(), bytes: m.TransferredBytes()}},
+		pieceMapWidth:   60,
+		progress:        progress.New(progress.WithSolidFill("#22C55E"), progress.WithoutPercentage()),
 	}
 }
 
@@ -124,31 +128,17 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 // updateStats reads the manager's current state and updates the model.
 func (m *Model) updateStats() {
-	completed := m.m.Completed()
-	completedCount := piece.CountCompleted(completed)
-	totalPieces := m.m.TotalPieces()
-	var downloaded int64
-	if totalPieces > 0 {
-		downloaded = int64(float64(completedCount) / float64(totalPieces) * float64(m.m.TotalLength()))
-	}
+	now := time.Now()
+	m.transferSamples = append(m.transferSamples, transferSample{
+		at:    now,
+		bytes: m.m.TransferredBytes(),
+	})
+	m.updateDownloadRate(now, 3*time.Second)
 
-	// Compute download rate from delta since last tick.
-	elapsed := time.Since(m.lastTime).Seconds()
-	if elapsed > 0 {
-		diff := downloaded - m.lastBytes
-		if diff > 0 {
-			m.downloadRate = float64(diff) / elapsed
-		} else if diff == 0 && m.downloadRate > 0 {
-			// No new data — decay the rate so it trends toward zero
-			m.downloadRate *= 0.9
-		}
-	}
-	m.lastBytes = downloaded
-	m.lastTime = time.Now()
-
-	// Store progress as 0.0 – 1.0 and update the progress bar
-	if totalPieces > 0 {
-		m.percent = float64(completedCount) / float64(totalPieces)
+	// Progress is based on exact verified bytes, including a short final piece.
+	totalLength := m.m.TotalLength()
+	if totalLength > 0 {
+		m.percent = float64(m.m.CompletedBytes()) / float64(totalLength)
 	}
 	if m.percent < 0 {
 		m.percent = 0
@@ -158,10 +148,32 @@ func (m *Model) updateStats() {
 	}
 }
 
+func (m *Model) updateDownloadRate(now time.Time, window time.Duration) {
+	cutoff := now.Add(-window)
+	first := 0
+	for first+1 < len(m.transferSamples) && !m.transferSamples[first+1].at.After(cutoff) {
+		first++
+	}
+	m.transferSamples = m.transferSamples[first:]
+
+	oldest := m.transferSamples[0]
+	latest := m.transferSamples[len(m.transferSamples)-1]
+	elapsed := latest.at.Sub(oldest.at).Seconds()
+	if elapsed <= 0 || latest.bytes < oldest.bytes {
+		m.downloadRate = 0
+		return
+	}
+	m.downloadRate = float64(latest.bytes-oldest.bytes) / elapsed
+}
+
 // View renders the terminal UI.
 func (m Model) View() tea.View {
 	if !m.ready {
-		return tea.NewView("Initialising...")
+		status := m.m.Status()
+		if status == "" {
+			status = "Initialising..."
+		}
+		return tea.NewView(status)
 	}
 
 	if m.err != nil {
@@ -225,7 +237,12 @@ func (m Model) renderHeader() string {
 	}
 	title := lipgloss.NewStyle().Foreground(white).Bold(true).Render(name)
 	label := lipgloss.NewStyle().Foreground(indigo).Render("GoTorrent")
-	return fmt.Sprintf("  %s  %s", label, title)
+	status := m.m.Status()
+	if status == "" {
+		status = "Idle"
+	}
+	statusLine := lipgloss.NewStyle().Foreground(gray).Render(status)
+	return fmt.Sprintf("  %s  %s\n  %s", label, title, statusLine)
 }
 
 // renderProgress renders the official bubbles/progress bar with percentage on the right.
@@ -239,12 +256,7 @@ func (m Model) renderStats() string {
 	total := m.m.TotalPieces()
 	peers := len(m.m.Peers())
 
-	pct := 0.0
-	if total > 0 {
-		pct = float64(completed) / float64(total) * 100
-	}
-
-	downloaded := int64(pct / 100.0 * float64(m.m.TotalLength()))
+	downloaded := int64(m.m.CompletedBytes())
 	speed := m.formatSpeed(m.downloadRate)
 	eta := m.formatETA(m.downloadRate, int64(m.m.TotalLength())-downloaded)
 	size := m.formatBytes(int64(m.m.TotalLength()))

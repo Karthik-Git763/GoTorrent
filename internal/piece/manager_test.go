@@ -156,6 +156,33 @@ func TestNextPiece_SkipsCompleted(t *testing.T) {
 	}
 }
 
+func TestCompletedBytesUsesExactFinalPieceSize(t *testing.T) {
+	m := &Manager{
+		totalPieces: 3,
+		pieceLength: 4,
+		totalLength: 10,
+		completed:   []bool{true, false, true},
+	}
+
+	if got, want := m.CompletedBytes(), uint64(6); got != want {
+		t.Fatalf("CompletedBytes() = %d, want %d", got, want)
+	}
+}
+
+func TestCompletedBytesIncludesResumedPieces(t *testing.T) {
+	m := &Manager{
+		totalPieces: 3,
+		pieceLength: 4,
+		totalLength: 10,
+		completed:   make([]bool, 3),
+	}
+	m.SetCompleted([]bool{true, true, false})
+
+	if got, want := m.CompletedBytes(), uint64(8); got != want {
+		t.Fatalf("CompletedBytes() = %d, want %d", got, want)
+	}
+}
+
 func TestNextPiece_SkipsInProgressForRarest(t *testing.T) {
 	peers := []*peer.PeerConnection{
 		makePeerWithBitfield([]bool{true, true, true}),

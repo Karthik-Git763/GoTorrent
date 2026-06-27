@@ -177,6 +177,69 @@ func TestConnectToPeers_SinglePeer(t *testing.T) {
 	pc.Close()
 }
 
+func TestConnectToPeersWithIDUsesAnnouncedPeerID(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen: %v", err)
+	}
+	defer listener.Close()
+
+	var infoHash [20]byte
+	copy(infoHash[:], []byte("testinfohash12345678"))
+	var announcedPeerID [20]byte
+	copy(announcedPeerID[:], []byte("-GT0001-abcdefghijkl"))
+	receivedPeerID := make(chan [20]byte, 1)
+
+	go func() {
+		conn, acceptErr := listener.Accept()
+		if acceptErr != nil {
+			return
+		}
+		defer conn.Close()
+
+		handshake := make([]byte, 68)
+		if _, readErr := io.ReadFull(conn, handshake); readErr != nil {
+			return
+		}
+		var got [20]byte
+		copy(got[:], handshake[48:68])
+		receivedPeerID <- got
+
+		response := make([]byte, 68)
+		response[0] = 19
+		copy(response[1:], []byte("BitTorrent protocol"))
+		copy(response[28:], infoHash[:])
+		copy(response[48:], []byte("mockpeeridd12345678"))
+		if _, writeErr := conn.Write(response); writeErr != nil {
+			return
+		}
+		_ = WriteMessage(conn, &Message{ID: MsgBitfield, Payload: []byte{0x80}})
+		_, _ = ReadMessage(conn)
+	}()
+
+	tf := &torrent.TorrentFile{
+		InfoHash:    infoHash,
+		PieceHashes: make([][20]byte, 1),
+		PieceLength: 16384,
+		Length:      16384,
+		Name:        "test.torrent",
+	}
+	addr := listener.Addr().(*net.TCPAddr)
+	connections, report := ConnectToPeersWithID(tf, []tracker.Peer{{IP: addr.IP, Port: uint16(addr.Port)}}, announcedPeerID)
+	defer func() {
+		for _, connection := range connections {
+			connection.Close()
+		}
+	}()
+
+	if len(connections) != 1 || report.Handshaken != 1 {
+		t.Fatalf("connections = %d, handshaken = %d; want 1, 1", len(connections), report.Handshaken)
+	}
+	if got := <-receivedPeerID; got != announcedPeerID {
+		t.Fatalf("handshake peer ID = %q, want announced ID %q", got, announcedPeerID)
+	}
+}
+
 func TestConnectToPeers_SkipUnreachable(t *testing.T) {
 	torrentFile := &torrent.TorrentFile{
 		InfoHash:    [20]byte{},

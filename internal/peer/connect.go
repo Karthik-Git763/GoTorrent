@@ -14,6 +14,21 @@ import (
 
 const peerIDPrefix = "-GT0001-"
 
+// ConnectFailure records where an outbound peer connection failed.
+type ConnectFailure struct {
+	Address string
+	Stage   string
+	Err     error
+}
+
+// ConnectReport summarizes one batch of outbound peer connection attempts.
+type ConnectReport struct {
+	Attempted  int
+	Dialed     int
+	Handshaken int
+	Failures   []ConnectFailure
+}
+
 // GeneratePeerID creates a 20-byte BitTorrent peer ID with GoTorrent's client prefix.
 func GeneratePeerID() [20]byte {
 	var id [20]byte
@@ -46,11 +61,24 @@ func countSetBits(bits []bool) int {
 // Returns only the peers that successfully completed the full handshake flow.
 // Unreachable or slow peers are skipped silently.
 func ConnectToPeers(torrent *torrent.TorrentFile, peers []tracker.Peer) []*PeerConnection {
+	connections, _ := ConnectToPeersWithID(torrent, peers, GeneratePeerID())
+	return connections
+}
+
+// ConnectToPeersWithID connects to peers using the same peer ID that was sent
+// to the tracker and returns diagnostics for failed connection stages.
+func ConnectToPeersWithID(torrent *torrent.TorrentFile, peers []tracker.Peer, localPeerID [20]byte) ([]*PeerConnection, ConnectReport) {
 	var (
 		mu          sync.Mutex
 		connections []*PeerConnection
 		wg          sync.WaitGroup
+		report      = ConnectReport{Attempted: len(peers)}
 	)
+	recordFailure := func(address, stage string, err error) {
+		mu.Lock()
+		report.Failures = append(report.Failures, ConnectFailure{Address: address, Stage: stage, Err: err})
+		mu.Unlock()
+	}
 
 	for _, p := range peers {
 		wg.Go(func() {
@@ -58,25 +86,42 @@ func ConnectToPeers(torrent *torrent.TorrentFile, peers []tracker.Peer) []*PeerC
 			addr := net.JoinHostPort(p.IP.String(), fmt.Sprintf("%d", p.Port))
 			conn, err := net.DialTimeout("tcp", addr, 10*time.Second)
 			if err != nil {
-				return // peer unreachable, skip silently
-			}
-
-			// BitTorrent handshake
-			peerID := GeneratePeerID()
-			remoteID, err := Handshake(conn, torrent.InfoHash, peerID)
-			if err != nil {
-				conn.Close()
+				recordFailure(addr, "dial", err)
 				return
 			}
+			mu.Lock()
+			report.Dialed++
+			mu.Unlock()
+
+			// BitTorrent handshake
+			remoteID, err := Handshake(conn, torrent.InfoHash, localPeerID)
+			if err != nil {
+				conn.Close()
+				recordFailure(addr, "handshake", err)
+				return
+			}
+			mu.Lock()
+			report.Handshaken++
+			mu.Unlock()
 
 			// Start goroutine pair (reader + writer)
 			pc := NewPeerConnection(conn, remoteID)
 			pc.Start()
+			if !pc.SendInterested() {
+				pc.Close()
+				recordFailure(addr, "interested", fmt.Errorf("connection closed"))
+				return
+			}
 
 			// Read an optional initial bitfield. BEP 3 peers with no pieces may skip it.
 			pc.SetBitfield(make([]bool, len(torrent.PieceHashes)))
 			select {
-			case msg := <-pc.Incoming():
+			case msg, ok := <-pc.Incoming():
+				if !ok {
+					pc.Close()
+					recordFailure(addr, "initial message", fmt.Errorf("connection closed"))
+					return
+				}
 				if msg.ID == MsgBitfield {
 					pc.SetBitfield(ParseBitfield(msg.Payload, len(torrent.PieceHashes)))
 				} else if msg.ID == MsgHave && len(msg.Payload) == 4 {
@@ -88,11 +133,8 @@ func ConnectToPeers(torrent *torrent.TorrentFile, peers []tracker.Peer) []*PeerC
 				}
 			case <-time.After(10 * time.Second):
 				// No bitfield is valid; continue and learn availability from Have.
-			}
-
-			// Send Interested
-			if err := WriteMessage(conn, &Message{ID: MsgInterested}); err != nil {
-				pc.Close()
+			case <-pc.Done():
+				recordFailure(addr, "initial message", fmt.Errorf("connection closed"))
 				return
 			}
 
@@ -104,5 +146,5 @@ func ConnectToPeers(torrent *torrent.TorrentFile, peers []tracker.Peer) []*PeerC
 	}
 
 	wg.Wait()
-	return connections
+	return connections, report
 }

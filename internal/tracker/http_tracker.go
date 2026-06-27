@@ -1,6 +1,7 @@
 package tracker
 
 import (
+	"context"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -18,6 +19,13 @@ type Peer struct {
 
 // AnnounceHTTP sends an HTTP announce request to the tracker and returns the list of peers.
 func AnnounceHTTP(announceURL string, infoHash [20]byte, peerID [20]byte, port uint16, totalLength int64) ([]Peer, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), defaultAnnounceTimeout)
+	defer cancel()
+	return AnnounceHTTPContext(ctx, announceURL, infoHash, peerID, port, totalLength)
+}
+
+// AnnounceHTTPContext sends an HTTP announce that can be cancelled by ctx.
+func AnnounceHTTPContext(ctx context.Context, announceURL string, infoHash [20]byte, peerID [20]byte, port uint16, totalLength int64) ([]Peer, error) {
 	// Parse the announce URL
 	parsedURL, err := url.Parse(announceURL)
 	if err != nil {
@@ -34,14 +42,21 @@ func AnnounceHTTP(announceURL string, infoHash [20]byte, peerID [20]byte, port u
 	query.Set("compact", "1")
 	// Encode the query parameters and set the URL
 	parsedURL.RawQuery = query.Encode()
-	req, err := http.Get(parsedURL.String())
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, parsedURL.String(), nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return nil, err
 	}
 	// Close the response body when done
-	defer req.Body.Close()
+	defer resp.Body.Close()
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		return nil, fmt.Errorf("tracker returned HTTP %s", resp.Status)
+	}
 	// Read the response body
-	body, err := io.ReadAll(req.Body)
+	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, err
 	}

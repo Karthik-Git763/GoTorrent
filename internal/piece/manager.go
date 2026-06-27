@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"sync"
+	"sync/atomic"
 
 	"go-torrent/internal/peer"
 	"go-torrent/internal/torrent"
@@ -44,8 +45,9 @@ type Manager struct {
 	outputName   string              // torrent name for output files
 	files        []torrent.FileEntry // multi-file entries (nil for single-file)
 
-	mu         sync.Mutex
-	inProgress map[uint32]bool
+	mu          sync.Mutex
+	inProgress  map[uint32]bool
+	transferred atomic.Uint64 // accepted peer/webseed payload bytes, including retries
 
 	// Resume support
 	savePath string   // path to .gtstate file (empty = no periodic saves)
@@ -56,6 +58,7 @@ type Manager struct {
 
 	// Status output
 	logWriter io.Writer // status messages (stderr by default, silenced in TUI mode)
+	status    string    // high-level runtime status for the TUI
 }
 
 // NewManager creates a Manager ready to start downloading.
@@ -145,7 +148,7 @@ func (m *Manager) Download(outputPath string, resume bool) error {
 	}()
 
 	// Collector: read piece results, write to file, and track progress
-	completedPieces := CountCompleted(m.completed)
+	completedPieces := CountCompleted(m.Completed())
 	lastSaveCount := completedPieces
 
 	for result := range m.pieceResults {
@@ -153,7 +156,7 @@ func (m *Manager) Download(outputPath string, resume bool) error {
 			cancel()
 			return result.Err
 		}
-		if result.Index >= uint32(len(m.completed)) || m.completed[result.Index] {
+		if result.Index >= uint32(len(m.completed)) || m.isCompleted(result.Index) {
 			continue
 		}
 
@@ -161,7 +164,7 @@ func (m *Manager) Download(outputPath string, resume bool) error {
 			return fmt.Errorf("writing piece %d: %w", result.Index, err)
 		}
 
-		m.completed[result.Index] = true
+		m.markCompleted(result.Index)
 		completedPieces++
 
 		// Announce the new piece to all connected peers so they can request it.
@@ -173,7 +176,7 @@ func (m *Manager) Download(outputPath string, resume bool) error {
 
 		// Periodic state save
 		if m.savePath != "" && completedPieces-lastSaveCount >= saveInterval {
-			if err := SaveResume(m.savePath, m.infoHash, m.completed); err != nil {
+			if err := SaveResume(m.savePath, m.infoHash, m.Completed()); err != nil {
 				fmt.Fprintf(m.logWriter, "\nWarning: failed to save resume state: %v\n", err)
 			}
 			lastSaveCount = completedPieces
@@ -314,6 +317,7 @@ func (m *Manager) webseedWorker(ctx context.Context, source webseed.Source) {
 			m.markNotInProgress(uint32(idx))
 			return
 		}
+		m.transferred.Add(uint64(len(data)))
 		if !m.verifyPiece(uint32(idx), data) {
 			source.Disable()
 			m.markNotInProgress(uint32(idx))
@@ -428,6 +432,7 @@ func (m *Manager) collectBlocks(p *peer.PeerConnection, idx int, pieceData []byt
 		}
 		copy(pieceData[begin:], blockData)
 		received[begin] = true
+		m.transferred.Add(uint64(len(blockData)))
 		remaining--
 	}
 	return true
@@ -526,6 +531,27 @@ func (m *Manager) SetLogWriter(w io.Writer) {
 	m.logWriter = w
 }
 
+// SetStatus updates the high-level runtime status shown in the TUI.
+func (m *Manager) SetStatus(status string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.status = status
+}
+
+// Status returns the latest runtime status string.
+func (m *Manager) Status() string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.status
+}
+
+// SetPeers replaces the active peer list.
+func (m *Manager) SetPeers(peers []*peer.PeerConnection) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.peers = peers
+}
+
 // Completed returns a copy of the completed bitfield for external save.
 func (m *Manager) Completed() []bool {
 	m.mu.Lock()
@@ -551,5 +577,35 @@ func (m *Manager) TotalPieces() int { return m.totalPieces }
 // TotalLength returns the total size of the torrent in bytes.
 func (m *Manager) TotalLength() uint64 { return m.totalLength }
 
+// CompletedBytes returns the exact number of verified bytes represented by the
+// completed bitfield. The final piece may be shorter than pieceLength.
+func (m *Manager) CompletedBytes() uint64 {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	var total uint64
+	for i, complete := range m.completed {
+		if !complete {
+			continue
+		}
+		size := m.pieceLength
+		if i == m.totalPieces-1 {
+			size = m.totalLength - uint64(i)*m.pieceLength
+		}
+		total += size
+	}
+	return total
+}
+
+// TransferredBytes returns accepted download payload bytes. Unlike
+// CompletedBytes, it includes data that is later rejected or downloaded again.
+func (m *Manager) TransferredBytes() uint64 { return m.transferred.Load() }
+
 // Peers returns the list of connected peer connections.
-func (m *Manager) Peers() []*peer.PeerConnection { return m.peers }
+func (m *Manager) Peers() []*peer.PeerConnection {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]*peer.PeerConnection, len(m.peers))
+	copy(out, m.peers)
+	return out
+}

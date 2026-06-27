@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -17,7 +18,13 @@ import (
 	"go-torrent/internal/tui"
 )
 
-const trackerDiscoveryTimeout = 3 * time.Second
+const (
+	trackerDiscoveryTimeout = 3 * time.Second
+	trackerFallbackTimeout  = 10 * time.Second
+)
+
+type announcePeersFunc func(context.Context) ([]tracker.Peer, error)
+type connectPeersFunc func([]tracker.Peer) ([]*peer.PeerConnection, peer.ConnectReport)
 
 // announceToTracker announces to every tracker concurrently and combines their peers.
 // When quiet is true, per-tracker diagnostics are not printed to stderr.
@@ -33,6 +40,73 @@ func announceToTracker(ctx context.Context, announceURLs []string, infoHash [20]
 		}
 	}
 	return peers, err
+}
+
+// discoverPeerConnections performs a fast discovery pass and, when requested,
+// one slower fallback pass if none of the first peers can be connected.
+func discoverPeerConnections(
+	allowFallback bool,
+	announce announcePeersFunc,
+	connect connectPeersFunc,
+	setStatus func(string),
+) ([]tracker.Peer, []*peer.PeerConnection, peer.ConnectReport, error) {
+	announceAttempt := func(timeout time.Duration) ([]tracker.Peer, error) {
+		ctx, cancel := context.WithTimeout(context.Background(), timeout)
+		defer cancel()
+		return announce(ctx)
+	}
+
+	setStatus("Connecting trackers...")
+	peers, firstErr := announceAttempt(trackerDiscoveryTimeout)
+	connections, report := connectDiscoveredPeers(peers, connect, setStatus)
+	if len(connections) > 0 || !allowFallback {
+		return peers, connections, report, firstErr
+	}
+
+	setStatus("Retrying trackers with extended timeout...")
+	retryPeers, retryErr := announceAttempt(trackerFallbackTimeout)
+	peers = mergeTrackerPeers(peers, retryPeers)
+	connections, retryReport := connectDiscoveredPeers(peers, connect, setStatus)
+	report = mergeConnectReports(report, retryReport)
+	if len(peers) > 0 {
+		return peers, connections, report, nil
+	}
+	return peers, connections, report, errors.Join(firstErr, retryErr)
+}
+
+func connectDiscoveredPeers(peers []tracker.Peer, connect connectPeersFunc, setStatus func(string)) ([]*peer.PeerConnection, peer.ConnectReport) {
+	if len(peers) == 0 {
+		return nil, peer.ConnectReport{}
+	}
+	setStatus(fmt.Sprintf("Connecting to %d peers...", len(peers)))
+	return connect(peers)
+}
+
+func mergeTrackerPeers(groups ...[]tracker.Peer) []tracker.Peer {
+	seen := make(map[string]struct{})
+	var merged []tracker.Peer
+	for _, peers := range groups {
+		for _, candidate := range peers {
+			key := fmt.Sprintf("%s:%d", candidate.IP.String(), candidate.Port)
+			if _, exists := seen[key]; exists {
+				continue
+			}
+			seen[key] = struct{}{}
+			merged = append(merged, candidate)
+		}
+	}
+	return merged
+}
+
+func mergeConnectReports(reports ...peer.ConnectReport) peer.ConnectReport {
+	var merged peer.ConnectReport
+	for _, report := range reports {
+		merged.Attempted += report.Attempted
+		merged.Dialed += report.Dialed
+		merged.Handshaken += report.Handshaken
+		merged.Failures = append(merged.Failures, report.Failures...)
+	}
+	return merged
 }
 
 func run() error {
@@ -85,16 +159,26 @@ func run() error {
 		return runTUIFlow(m, statePath, outputPath, &tf, peerID, uint16(*port))
 	}
 
-	var peers []tracker.Peer
+	var (
+		peers         []tracker.Peer
+		connections   []*peer.PeerConnection
+		connectReport peer.ConnectReport
+	)
 	if len(tf.AnnounceList) > 0 {
-		fmt.Printf("Announcing to %d trackers...\n", len(tf.AnnounceList))
 		fmt.Fprintf(os.Stderr, "  primary: %s\n", tf.Announce)
-		announceCtx, cancelAnnounce := context.WithTimeout(context.Background(), trackerDiscoveryTimeout)
-		peers, err = announceToTracker(announceCtx, tf.AnnounceList, tf.InfoHash, peerID, uint16(*port), tf.Length, false)
-		cancelAnnounce()
-		if err != nil {
+		peers, connections, connectReport, err = discoverPeerConnections(
+			len(tf.URLList) == 0 && len(tf.HTTPSeeds) == 0,
+			func(ctx context.Context) ([]tracker.Peer, error) {
+				return announceToTracker(ctx, tf.AnnounceList, tf.InfoHash, peerID, uint16(*port), tf.Length, false)
+			},
+			func(discovered []tracker.Peer) ([]*peer.PeerConnection, peer.ConnectReport) {
+				return peer.ConnectToPeersWithID(&tf, discovered, peerID)
+			},
+			func(status string) { fmt.Println(status) },
+		)
+		if err != nil && len(peers) == 0 {
 			if len(tf.URLList) == 0 && len(tf.HTTPSeeds) == 0 {
-				return fmt.Errorf("announcing to tracker: %w", err)
+				return fmt.Errorf("announcing to trackers after fallback: %w", err)
 			}
 			fmt.Fprintf(os.Stderr, "Warning: tracker announce failed; falling back to webseeds: %v\n", err)
 		}
@@ -103,7 +187,6 @@ func run() error {
 	}
 	fmt.Printf("Got %d peers from tracker\n", len(peers))
 
-	connections, connectReport := peer.ConnectToPeersWithID(&tf, peers, peerID)
 	defer func() {
 		for _, conn := range connections {
 			conn.Close()
@@ -113,6 +196,10 @@ func run() error {
 	if len(connections) == 0 && len(peers) > 0 {
 		fmt.Fprintf(os.Stderr, "Peer connection summary: %d dialed, %d handshaken, %d usable\n",
 			connectReport.Dialed, connectReport.Handshaken, len(connections))
+	}
+	if len(connections) == 0 && len(tf.URLList) == 0 && len(tf.HTTPSeeds) == 0 {
+		return fmt.Errorf("trackers returned %d peers after fallback, but none connected (%d dialed, %d completed handshake)",
+			len(peers), connectReport.Dialed, connectReport.Handshaken)
 	}
 
 	m.SetPeers(connections)
@@ -149,21 +236,35 @@ func runTUIFlow(m *piece.Manager, statePath, outputPath string, tf *torrent.Torr
 	m.SetStatus("Connecting trackers...")
 
 	go func() {
-		var peers []tracker.Peer
+		var (
+			peers         []tracker.Peer
+			connections   []*peer.PeerConnection
+			connectReport peer.ConnectReport
+			announceErr   error
+		)
 		if len(tf.AnnounceList) > 0 {
-			announceCtx, cancelAnnounce := context.WithTimeout(context.Background(), trackerDiscoveryTimeout)
-			peers, _ = announceToTracker(announceCtx, tf.AnnounceList, tf.InfoHash, peerID, port, tf.Length, true)
-			cancelAnnounce()
+			peers, connections, connectReport, announceErr = discoverPeerConnections(
+				len(tf.URLList) == 0 && len(tf.HTTPSeeds) == 0,
+				func(ctx context.Context) ([]tracker.Peer, error) {
+					return announceToTracker(ctx, tf.AnnounceList, tf.InfoHash, peerID, port, tf.Length, true)
+				},
+				func(discovered []tracker.Peer) ([]*peer.PeerConnection, peer.ConnectReport) {
+					return peer.ConnectToPeersWithID(tf, discovered, peerID)
+				},
+				m.SetStatus,
+			)
 		}
 
 		if len(peers) == 0 && len(tf.URLList) == 0 && len(tf.HTTPSeeds) == 0 {
 			m.SetStatus("No peers or webseeds available")
-			doneCh <- fmt.Errorf("no peers or webseeds available")
+			if announceErr != nil {
+				doneCh <- fmt.Errorf("tracker discovery failed after fallback: %w", announceErr)
+			} else {
+				doneCh <- fmt.Errorf("no peers or webseeds available after tracker fallback")
+			}
 			return
 		}
 
-		m.SetStatus("Connecting peers...")
-		connections, connectReport := peer.ConnectToPeersWithID(tf, peers, peerID)
 		defer func() {
 			for _, conn := range connections {
 				conn.Close()
@@ -173,7 +274,7 @@ func runTUIFlow(m *piece.Manager, statePath, outputPath string, tf *torrent.Torr
 
 		if len(connections) == 0 && len(tf.URLList) == 0 && len(tf.HTTPSeeds) == 0 {
 			m.SetStatus("No peers connected")
-			doneCh <- fmt.Errorf("trackers returned %d peers, but none connected (%d dialed, %d completed handshake)",
+			doneCh <- fmt.Errorf("trackers returned %d peers after fallback, but none connected (%d dialed, %d completed handshake)",
 				len(peers), connectReport.Dialed, connectReport.Handshaken)
 			return
 		}
